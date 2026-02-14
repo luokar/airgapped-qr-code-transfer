@@ -19,14 +19,17 @@
           {{transfer_summary.total_chunks}} | SHA256:
           {{short_checksum(transfer_summary.file_sha256)}}
         </div>
-        <div class="w-1/2 mb-4">
+        <div v-show="!is_transferring" class="w-1/2 mb-4">
           <input
             class="block w-full text-sm text-gray-900 border border-gray-300 cursor-pointer bg-gray-50 focus:outline-none"
             id="file_input"
             type="file"
           />
         </div>
-        <div class="w-3/4 mb-4 text-sm border border-gray-300 p-2">
+        <div
+          v-show="!is_transferring"
+          class="w-3/4 mb-4 text-sm border border-gray-300 p-2"
+        >
           <div class="font-semibold mb-2">Sender Preset</div>
           <label>
             Profile
@@ -81,7 +84,8 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.0.3/pako.min.js"></script>
     <script>
-      const { createApp, ref, reactive, computed, onMounted } = Vue;
+      const { createApp, ref, reactive, computed, onMounted, nextTick, watch } =
+        Vue;
 
       // Edit this object to fine-tune transfer presets.
       const SENDER_PRESETS = {
@@ -221,9 +225,64 @@
             file_sha256: "",
           });
           let qrcode_object = "";
+          let current_qr_payload = "Choose file to get started";
+          let current_qr_size = 0;
           let active_transfer = null;
 
           const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+          const fit_qr_to_viewport = (scroll_to_center = false) => {
+            const qrcode_element = document.getElementById("qrcode");
+            if (!qrcode_element) {
+              return;
+            }
+
+            const viewport_padding = 12;
+            const rect = qrcode_element.getBoundingClientRect();
+            const available_height = Math.floor(
+              window.innerHeight - rect.top - viewport_padding
+            );
+            const available_width = Math.floor(
+              window.innerWidth - viewport_padding * 2
+            );
+            const target_size = Math.max(
+              1,
+              Math.min(available_height, available_width)
+            );
+
+            if (!qrcode_object || target_size !== current_qr_size) {
+              current_qr_size = target_size;
+              qrcode_element.innerHTML = "";
+              qrcode_object = new QRCode("qrcode", {
+                text: current_qr_payload,
+                width: target_size,
+                height: target_size,
+                typeNumber: 40,
+                colorDark: "#000000",
+                colorLight: "#ffffff",
+                correctLevel: QRCode.CorrectLevel.M,
+              });
+            }
+
+            if (scroll_to_center) {
+              qrcode_element.scrollIntoView({ block: "center", behavior: "auto" });
+            }
+          };
+
+          const show_qr_payload = (payload) => {
+            if (!qrcode_object) {
+              fit_qr_to_viewport(false);
+            }
+            current_qr_payload = payload;
+            qrcode_object.clear();
+            qrcode_object.makeCode(payload);
+          };
+
+          const set_pointer_visibility = (hidden) => {
+            const cursor_style = hidden ? "none" : "";
+            document.body.style.cursor = cursor_style;
+            document.documentElement.style.cursor = cursor_style;
+          };
 
           const get_sender_config = () => {
             const selected_profile =
@@ -606,6 +665,9 @@
           };
 
           const can_fit_in_qr = (packet) => {
+            if (!qrcode_object) {
+              fit_qr_to_viewport(false);
+            }
             try {
               qrcode_object.makeCode(packet);
               return true;
@@ -656,10 +718,11 @@
             }
 
             is_transferring.value = true;
+            await nextTick();
+            fit_qr_to_viewport(true);
 
             for (let i = 0; i < runtime_config.metadata_repeat_count; i++) {
-              qrcode_object.clear();
-              qrcode_object.makeCode(active_transfer.metadata_packet);
+              show_qr_payload(active_transfer.metadata_packet);
               await sleep(runtime_config.frame_interval_ms);
             }
 
@@ -676,8 +739,7 @@
                   break outer_loop;
                 }
 
-                qrcode_object.clear();
-                qrcode_object.makeCode(packet);
+                show_qr_payload(packet);
                 sent_count += 1;
                 user_message.value = `${phase_label} round ${round + 1}/${rounds} chunk ${
                   chunk_index + 1
@@ -719,6 +781,8 @@
             }
 
             is_transferring.value = true;
+            await nextTick();
+            fit_qr_to_viewport(true);
 
             try {
               const file_buffer = await file.arrayBuffer();
@@ -901,16 +965,22 @@
 
           onMounted(() => {
             console.log("Application Initialized ...");
-            let lowest_size =
-              Math.min(window.innerWidth, window.innerHeight) / 1.5;
-            qrcode_object = new QRCode("qrcode", {
-              text: "Choose file to get started",
-              width: lowest_size,
-              height: lowest_size,
-              typeNumber: 40,
-              colorDark: "#000000",
-              colorLight: "#ffffff",
-              correctLevel: QRCode.CorrectLevel.M,
+            fit_qr_to_viewport(true);
+            watch(
+              is_transferring,
+              (value) => {
+                set_pointer_visibility(value);
+              },
+              { immediate: true }
+            );
+            let resize_timer = null;
+            window.addEventListener("resize", () => {
+              if (resize_timer) {
+                clearTimeout(resize_timer);
+              }
+              resize_timer = setTimeout(() => {
+                fit_qr_to_viewport(false);
+              }, 120);
             });
           });
 

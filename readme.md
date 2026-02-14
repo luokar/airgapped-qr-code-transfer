@@ -23,6 +23,7 @@ The app is built with Vue.js and uses:
 - Retry backoff for high-loss rounds (slower but more robust retries when needed)
 - Chunk safety margin to avoid operating at fragile QR capacity limits
 - Large-transfer adaptive initial repeat boosting to avoid early-stall progress
+- Generator auto-fits and centers QR in viewport when transfer starts
 
 ## Quick Start
 
@@ -48,6 +49,7 @@ Available presets:
 - `Reliable`
 
 `Aggressive` and `Extreme` increase throughput but can increase packet loss depending on camera, focus, distance, and display quality.
+Current defaults are tuned for higher-resolution cameras with larger chunk targets on high-performance presets.
 
 ### Edit Presets in Source
 
