@@ -220,8 +220,50 @@
           retry_high_loss_repeat_increment: 1,
         },
       };
-      const DEFAULT_PRESET_NAME = "Balanced";
+      const DEFAULT_PRESET_NAME = "Extreme";
       const RETRY_CODE_EMPTY_PAYLOAD = "OK";
+
+      const get_preset_speed_score = (preset) => {
+        if (!preset) {
+          return 0;
+        }
+        const initial_chunk_size = Math.max(
+          80,
+          Number(preset.initial_chunk_size) ||
+            SENDER_PRESETS[DEFAULT_PRESET_NAME].initial_chunk_size
+        );
+        const chunk_safety_ratio = Math.min(
+          0.98,
+          Math.max(
+            0.6,
+            Number(preset.chunk_safety_ratio) ||
+              SENDER_PRESETS[DEFAULT_PRESET_NAME].chunk_safety_ratio
+          )
+        );
+        const frame_interval_ms = Math.max(
+          20,
+          Number(preset.frame_interval_ms) ||
+            SENDER_PRESETS[DEFAULT_PRESET_NAME].frame_interval_ms
+        );
+        const initial_pass_repeat_count = Math.max(
+          1,
+          Number(preset.initial_pass_repeat_count) ||
+            SENDER_PRESETS[DEFAULT_PRESET_NAME].initial_pass_repeat_count
+        );
+        const start_delay_ms = Math.max(
+          0,
+          Number(preset.start_delay_ms) ||
+            SENDER_PRESETS[DEFAULT_PRESET_NAME].start_delay_ms
+        );
+
+        const payload_per_frame = initial_chunk_size * chunk_safety_ratio;
+        const startup_penalty = 1 + Math.min(2, start_delay_ms / 2000);
+
+        return (
+          payload_per_frame /
+          (frame_interval_ms * initial_pass_repeat_count * startup_penalty)
+        );
+      };
 
       const CRC32_TABLE = (() => {
         const table = new Uint32Array(256);
@@ -243,7 +285,15 @@
           const retry_feedback = ref("");
           const retry_feedback_is_error = ref(false);
           const selected_preset = ref(DEFAULT_PRESET_NAME);
-          const preset_names = Object.keys(SENDER_PRESETS);
+          const preset_names = Object.keys(SENDER_PRESETS).sort((a, b) => {
+            const speed_delta =
+              get_preset_speed_score(SENDER_PRESETS[b]) -
+              get_preset_speed_score(SENDER_PRESETS[a]);
+            if (Math.abs(speed_delta) > 1e-9) {
+              return speed_delta;
+            }
+            return a.localeCompare(b);
+          });
           const transfer_summary = reactive({
             ready: false,
             session_id: "",
