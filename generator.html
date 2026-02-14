@@ -26,6 +26,21 @@
             type="file"
           />
         </div>
+        <div class="w-3/4 mb-4 text-sm border border-gray-300 p-2">
+          <div class="font-semibold mb-2">Sender Preset</div>
+          <label>
+            Profile
+            <select
+              v-model="selected_preset"
+              class="block w-full border border-gray-300 px-1"
+            >
+              <option v-for="name in preset_names" :key="name" :value="name">
+                {{name}}
+              </option>
+            </select>
+          </label>
+          <div class="mt-2 text-xs">{{preset_summary}}</div>
+        </div>
         <button
           v-if="!is_transferring"
           v-on:click="start_transfer"
@@ -59,22 +74,69 @@
           </button>
         </div>
         <div id="qrcode" class=""></div>
+        <div style="height: 35vh"></div>
       </div>
     </div>
     <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.0.3/pako.min.js"></script>
     <script>
-      const { createApp, ref, reactive, onMounted } = Vue;
+      const { createApp, ref, reactive, computed, onMounted } = Vue;
 
-      const INITIAL_CHUNK_SIZE = 420;
-      const MIN_CHUNK_SIZE = 80;
-      const FRAME_INTERVAL_MS = 80;
-      const START_DELAY_MS = 500;
-      const COMPRESSION_LEVEL = 3;
-      const METADATA_REPEAT_COUNT = 3;
-      const INITIAL_PASS_REPEAT_COUNT = 2;
-      const RETRY_REPEAT_COUNT = 2;
+      // Edit this object to fine-tune transfer presets.
+      const SENDER_PRESETS = {
+        Fast: {
+          initial_chunk_size: 360,
+          min_chunk_size: 90,
+          frame_interval_ms: 65,
+          start_delay_ms: 500,
+          compression_level: 2,
+          metadata_repeat_count: 3,
+          initial_pass_repeat_count: 2,
+          retry_repeat_count: 2,
+        },
+        Aggressive: {
+          initial_chunk_size: 440,
+          min_chunk_size: 100,
+          frame_interval_ms: 52,
+          start_delay_ms: 360,
+          compression_level: 1,
+          metadata_repeat_count: 2,
+          initial_pass_repeat_count: 1,
+          retry_repeat_count: 2,
+        },
+        Extreme: {
+          initial_chunk_size: 560,
+          min_chunk_size: 120,
+          frame_interval_ms: 40,
+          start_delay_ms: 240,
+          compression_level: 0,
+          metadata_repeat_count: 2,
+          initial_pass_repeat_count: 1,
+          retry_repeat_count: 1,
+        },
+        Balanced: {
+          initial_chunk_size: 300,
+          min_chunk_size: 80,
+          frame_interval_ms: 95,
+          start_delay_ms: 700,
+          compression_level: 3,
+          metadata_repeat_count: 4,
+          initial_pass_repeat_count: 3,
+          retry_repeat_count: 2,
+        },
+        Reliable: {
+          initial_chunk_size: 240,
+          min_chunk_size: 80,
+          frame_interval_ms: 120,
+          start_delay_ms: 900,
+          compression_level: 4,
+          metadata_repeat_count: 5,
+          initial_pass_repeat_count: 3,
+          retry_repeat_count: 3,
+        },
+      };
+      const DEFAULT_PRESET_NAME = "Balanced";
 
       const CRC32_TABLE = (() => {
         const table = new Uint32Array(256);
@@ -93,6 +155,8 @@
           const user_message = ref("Choose file to get started");
           const is_transferring = ref(false);
           const retry_code_input = ref("");
+          const selected_preset = ref(DEFAULT_PRESET_NAME);
+          const preset_names = Object.keys(SENDER_PRESETS);
           const transfer_summary = reactive({
             ready: false,
             session_id: "",
@@ -105,6 +169,82 @@
           let active_transfer = null;
 
           const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+          const get_sender_config = () => {
+            const selected_profile =
+              SENDER_PRESETS[selected_preset.value] ||
+              SENDER_PRESETS[DEFAULT_PRESET_NAME];
+
+            const initial_chunk_size = Math.floor(
+              Math.max(
+                80,
+                Number(selected_profile.initial_chunk_size) ||
+                  SENDER_PRESETS[DEFAULT_PRESET_NAME].initial_chunk_size
+              )
+            );
+            const min_chunk_size = Math.floor(
+              Math.max(
+                40,
+                Number(selected_profile.min_chunk_size) ||
+                  SENDER_PRESETS[DEFAULT_PRESET_NAME].min_chunk_size
+              )
+            );
+
+            return {
+              initial_chunk_size,
+              min_chunk_size: Math.min(min_chunk_size, initial_chunk_size),
+              frame_interval_ms: Math.floor(
+                Math.max(
+                  20,
+                  Number(selected_profile.frame_interval_ms) ||
+                    SENDER_PRESETS[DEFAULT_PRESET_NAME].frame_interval_ms
+                )
+              ),
+              start_delay_ms: Math.floor(
+                Math.max(
+                  0,
+                  Number(selected_profile.start_delay_ms) ||
+                    SENDER_PRESETS[DEFAULT_PRESET_NAME].start_delay_ms
+                )
+              ),
+              compression_level: Math.floor(
+                Math.min(
+                  9,
+                  Math.max(
+                    0,
+                    Number(selected_profile.compression_level) ||
+                      SENDER_PRESETS[DEFAULT_PRESET_NAME].compression_level
+                  )
+                )
+              ),
+              metadata_repeat_count: Math.floor(
+                Math.max(
+                  1,
+                  Number(selected_profile.metadata_repeat_count) ||
+                    SENDER_PRESETS[DEFAULT_PRESET_NAME].metadata_repeat_count
+                )
+              ),
+              initial_pass_repeat_count: Math.floor(
+                Math.max(
+                  1,
+                  Number(selected_profile.initial_pass_repeat_count) ||
+                    SENDER_PRESETS[DEFAULT_PRESET_NAME].initial_pass_repeat_count
+                )
+              ),
+              retry_repeat_count: Math.floor(
+                Math.max(
+                  1,
+                  Number(selected_profile.retry_repeat_count) ||
+                    SENDER_PRESETS[DEFAULT_PRESET_NAME].retry_repeat_count
+                )
+              ),
+            };
+          };
+
+          const preset_summary = computed(() => {
+            const config = get_sender_config();
+            return `chunk=${config.initial_chunk_size}, frame=${config.frame_interval_ms}ms, start=${config.start_delay_ms}ms, comp=${config.compression_level}, meta=${config.metadata_repeat_count}, init=${config.initial_pass_repeat_count}, retry=${config.retry_repeat_count}`;
+          });
 
           const crc32_bytes = (bytes) => {
             let crc = 0xffffffff;
@@ -281,11 +421,25 @@
             total_chunks,
             compressed_length,
             file_size,
-            file_sha256
+            file_sha256,
+            sender_profile
           ) => {
-            return `M:${session_id}:${total_chunks}:${compressed_length}:${file_size}:${file_sha256}:${text_to_base64(
+            return `M:${session_id}:${total_chunks}:${compressed_length}:${file_size}:${file_sha256}:${sender_profile}:${text_to_base64(
               file_name
             )}`;
+          };
+
+          const build_sender_profile = (runtime_config) => {
+            return [
+              runtime_config.frame_interval_ms,
+              runtime_config.start_delay_ms,
+              runtime_config.metadata_repeat_count,
+              runtime_config.initial_pass_repeat_count,
+              runtime_config.retry_repeat_count,
+              runtime_config.initial_chunk_size,
+            ]
+              .map((value) => value.toString(36))
+              .join(".");
           };
 
           const build_data_packet = (
@@ -343,7 +497,8 @@
           const send_chunk_indices = async (
             chunk_indices,
             repeat_count,
-            phase_label
+            phase_label,
+            runtime_config
           ) => {
             if (!active_transfer || !chunk_indices.length) {
               return;
@@ -351,12 +506,13 @@
 
             is_transferring.value = true;
 
-            for (let i = 0; i < METADATA_REPEAT_COUNT; i++) {
+            for (let i = 0; i < runtime_config.metadata_repeat_count; i++) {
+              qrcode_object.clear();
               qrcode_object.makeCode(active_transfer.metadata_packet);
-              await sleep(FRAME_INTERVAL_MS);
+              await sleep(runtime_config.frame_interval_ms);
             }
 
-            await sleep(START_DELAY_MS);
+            await sleep(runtime_config.start_delay_ms);
 
             let sent_count = 0;
 
@@ -369,12 +525,13 @@
                   break outer_loop;
                 }
 
+                qrcode_object.clear();
                 qrcode_object.makeCode(packet);
                 sent_count += 1;
                 user_message.value = `${phase_label} chunk ${chunk_index + 1}/${
                   active_transfer.total_chunks
                 } (${i + 1}/${chunk_indices.length})`;
-                await sleep(FRAME_INTERVAL_MS);
+                await sleep(runtime_config.frame_interval_ms);
               }
             }
 
@@ -403,6 +560,7 @@
           const start_transfer = async () => {
             const file_input = document.getElementById("file_input");
             const file = file_input.files[0];
+            const runtime_config = get_sender_config();
 
             if (!file) {
               user_message.value = "Choose a file before starting transfer";
@@ -417,12 +575,13 @@
               const file_sha256 = await sha256_hex(original_bytes);
 
               const compressed_data = pako.gzip(file_buffer, {
-                level: COMPRESSION_LEVEL,
+                level: runtime_config.compression_level,
               });
               const session_id = Date.now().toString(36);
               let transfer_file_name = file.name;
+              const sender_profile = build_sender_profile(runtime_config);
 
-              let chunk_size = INITIAL_CHUNK_SIZE;
+              let chunk_size = runtime_config.initial_chunk_size;
               let total_chunks = 0;
               let metadata_packet = "";
 
@@ -434,7 +593,8 @@
                   total_chunks,
                   compressed_data.length,
                   original_bytes.length,
-                  file_sha256
+                  file_sha256,
+                  sender_profile
                 );
 
                 if (!can_fit_in_qr(metadata_packet)) {
@@ -465,7 +625,7 @@
                 }
 
                 chunk_size = Math.floor(chunk_size * 0.8);
-                if (chunk_size < MIN_CHUNK_SIZE) {
+                if (chunk_size < runtime_config.min_chunk_size) {
                   throw new Error(
                     "Unable to fit transfer packets into QR capacity"
                   );
@@ -497,8 +657,9 @@
               );
               await send_chunk_indices(
                 all_indices,
-                INITIAL_PASS_REPEAT_COUNT,
-                "Transferring"
+                runtime_config.initial_pass_repeat_count,
+                "Transferring",
+                runtime_config
               );
             } catch (error) {
               is_transferring.value = false;
@@ -513,6 +674,8 @@
               user_message.value = "Start a transfer before applying retry code";
               return;
             }
+
+            const runtime_config = get_sender_config();
 
             if (!retry_code_input.value) {
               user_message.value = "Paste retry code from receiver";
@@ -537,8 +700,9 @@
 
               await send_chunk_indices(
                 parsed.indices,
-                RETRY_REPEAT_COUNT,
-                "Retrying"
+                runtime_config.retry_repeat_count,
+                "Retrying",
+                runtime_config
               );
             } catch (error) {
               console.error(error);
@@ -569,6 +733,9 @@
             retry_code_input,
             retry_missing_chunks,
             transfer_summary,
+            selected_preset,
+            preset_names,
+            preset_summary,
             short_checksum,
           };
         },
