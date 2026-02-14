@@ -77,6 +77,19 @@
           </button>
         </div>
         <div id="qrcode" class=""></div>
+        <div
+          v-if="is_transferring && transfer_progress.expected_packets > 0"
+          class="fixed bottom-3 left-1/2 -translate-x-1/2 bg-white/90 border border-gray-400 px-3 py-2 text-xs z-50"
+        >
+          <div>
+            {{transfer_progress.phase}} {{transfer_progress_percent}}% | Packet
+            {{transfer_progress.sent_packets}}/{{transfer_progress.expected_packets}}
+          </div>
+          <div>
+            Round {{transfer_progress.current_round}}/{{transfer_progress.total_rounds}}
+            | Chunk {{transfer_progress.current_chunk}}/{{transfer_progress.total_chunks}}
+          </div>
+        </div>
         <div style="height: 35vh"></div>
       </div>
     </div>
@@ -229,6 +242,15 @@
             total_chunks: 0,
             file_size: 0,
             file_sha256: "",
+          });
+          const transfer_progress = reactive({
+            phase: "Idle",
+            current_chunk: 0,
+            total_chunks: 0,
+            current_round: 0,
+            total_rounds: 0,
+            sent_packets: 0,
+            expected_packets: 0,
           });
           let qrcode_object = "";
           let current_qr_payload = "Choose file to get started";
@@ -457,6 +479,19 @@
             return `chunk=${config.initial_chunk_size}, safe=${Math.round(
               config.chunk_safety_ratio * 100
             )}%, frame=${config.frame_interval_ms}ms, start=${config.start_delay_ms}ms, comp=${config.compression_level}, meta=${config.metadata_repeat_count}, hb=${config.metadata_heartbeat_interval}, init=${config.initial_pass_repeat_count}, retry=${config.retry_repeat_count}`;
+          });
+
+          const transfer_progress_percent = computed(() => {
+            if (!transfer_progress.expected_packets) {
+              return 0;
+            }
+            return Math.min(
+              100,
+              Math.floor(
+                (transfer_progress.sent_packets / transfer_progress.expected_packets) *
+                  100
+              )
+            );
           });
 
           const get_initial_pass_repeat_count = (runtime_config, total_chunks) => {
@@ -769,6 +804,13 @@
 
             let sent_count = 0;
             const rounds = Math.max(1, Math.floor(repeat_count));
+            transfer_progress.phase = phase_label;
+            transfer_progress.current_chunk = 0;
+            transfer_progress.total_chunks = active_transfer.total_chunks;
+            transfer_progress.current_round = 1;
+            transfer_progress.total_rounds = rounds;
+            transfer_progress.sent_packets = 0;
+            transfer_progress.expected_packets = chunk_indices.length * rounds;
 
             outer_loop: for (let round = 0; round < rounds; round++) {
               for (let i = 0; i < chunk_indices.length; i++) {
@@ -780,6 +822,9 @@
 
                 show_qr_payload(packet);
                 sent_count += 1;
+                transfer_progress.current_round = round + 1;
+                transfer_progress.current_chunk = chunk_index + 1;
+                transfer_progress.sent_packets = sent_count;
                 if (
                   runtime_config.metadata_heartbeat_interval > 0 &&
                   sent_count % runtime_config.metadata_heartbeat_interval === 0
@@ -796,6 +841,7 @@
 
             is_transferring.value = false;
             if (sent_count > 0) {
+              transfer_progress.phase = `${phase_label} done`;
               const expected_retry = build_retry_code(
                 active_transfer.session_id,
                 []
@@ -810,6 +856,7 @@
 
           const stop_transfer = () => {
             is_transferring.value = false;
+            transfer_progress.phase = "Paused";
             user_message.value = transfer_summary.ready
               ? "Transfer paused. Paste retry code to continue."
               : "Choose file to get started";
@@ -826,6 +873,13 @@
             }
 
             is_transferring.value = true;
+            transfer_progress.phase = "Preparing";
+            transfer_progress.current_chunk = 0;
+            transfer_progress.total_chunks = 0;
+            transfer_progress.current_round = 0;
+            transfer_progress.total_rounds = 0;
+            transfer_progress.sent_packets = 0;
+            transfer_progress.expected_packets = 0;
             await nextTick();
             fit_qr_to_viewport(true);
 
@@ -940,6 +994,7 @@
               );
             } catch (error) {
               is_transferring.value = false;
+              transfer_progress.phase = "Failed";
               console.error(error);
               user_message.value =
                 "Transfer failed. Reduce file size or move devices closer.";
@@ -1040,6 +1095,8 @@
             retry_code_input,
             retry_missing_chunks,
             transfer_summary,
+            transfer_progress,
+            transfer_progress_percent,
             selected_preset,
             preset_names,
             preset_summary,
