@@ -1,111 +1,111 @@
 # Airgapped QR Code Transfer Web App
 
-Airgapped QR Code Transfer is a simple web-based tool to transfer data between devices using QR codes. It allows for the transfer of files without the need for network connectivity, leveraging QR codes to encode and decode file data. This project uses Vue.js for the frontend and libraries like pako for compression, qrcode.js for QR code generation, and zbar-wasm for QR code scanning.
+Airgapped QR Code Transfer is a browser-only file transfer tool for offline or isolated environments.
+It moves files from a sender screen to a receiver camera using QR frames.
+
+The app is built with Vue.js and uses:
+- `qrcode.js` for QR generation
+- `zbar-wasm` for QR scanning
+- `pako` for gzip compression/decompression
 
 [![Open in Flexpilot AI Web IDE](https://badges.flexpilot.ai/open-in-web-ide.svg)](https://flexpilot.ai/web-ide-redirect?provider=github&owner=mohankumarelec&repo=airgapped-qr-code-transfer&branch=master)
 
-## Live Online Demo
+## What Is Implemented
 
-1. **Receiver Setup:**
-   - Open <a href="https://airgapped-qr-code-transfer.mohanram.co.in/scanner" target="_blank">scanner.html</a> in the receiver's browser.
-   - Allow access to the camera for scanning.
+- Adaptive QR payload sizing to avoid `code length overflow`
+- Sender presets for speed/reliability tradeoffs
+- Scanner auto-negotiation (no manual scanner tuning UI)
+- Selective retransmission with human-friendly retry code
+- Per-chunk CRC32 validation on receiver
+- End-to-end SHA-256 verification for final file integrity
+- Duplicate packet suppression and optimized chunk storage for better long-run performance
 
-2. **Sender Setup:**
-   - Open <a href="https://airgapped-qr-code-transfer.mohanram.co.in/generator" target="_blank">generator.html</a> in the sender's browser.
-   - Upload the file that needs to be transferred.
+## Quick Start
 
-3. **Transfer Process:**
-   - Click the "Start Receiver" button in the receiver's browser and point it to the sender's screen.
-   - In the sender's browser, click "Choose file" and then click "Start Transfer."
-   - Wait for all parts to be transferred. The file will be downloaded on the receiver's device.
+1. Open `scanner.html` on receiver device.
+2. Allow camera permission.
+3. Open `generator.html` on sender device.
+4. Select a sender preset.
+5. Choose a file and click `Start Transfer`.
+6. Point receiver camera at sender QR.
+7. If chunks are missing, generate retry code on receiver and paste it on sender.
+8. Sender resends only missing chunks.
 
-## Features
+## Sender Presets
 
-- **Data Sender Mode**: Allows a user to select a file, compress it, and transfer it via QR codes.
-- **Data Receiver Mode**: Allows a user to scan QR codes to receive and reconstruct the file.
-- **File Compression**: Uses gzip compression to reduce the size of the data being transferred.
-- **QR Code Generation and Scanning**: Uses qrcode.js for generation and zbar-wasm for scanning QR codes.
+Sender tuning is preset-based now.
+Choose profile in `generator.html` UI.
 
-## Getting Started
+Available presets:
+- `Fast`
+- `Aggressive`
+- `Extreme`
+- `Balanced`
+- `Reliable`
 
-### Prerequisites
+`Aggressive` and `Extreme` increase throughput but can increase packet loss depending on camera, focus, distance, and display quality.
 
-- A modern web browser (preferably Chrome or Firefox) that supports JavaScript and the WebRTC API.
+### Edit Presets in Source
 
-### Installing
+Presets are defined in `generator.html` under:
+- `SENDER_PRESETS`
+- `DEFAULT_PRESET_NAME`
 
-1. Clone the repository:
+Update these objects to customize profile behavior for your hardware.
 
-```sh
-git clone https://github.com/mohankumarelec/airgap-qr-transfer.git
-cd airgap-qr-transfer
-```
+## Scanner Auto-Negotiation
 
-2. Open the `generator.html` file in your browser for the sender interface:
+Scanner has no manual performance form now.
+It auto-adjusts scanning behavior from sender profile metadata plus local camera heuristics:
+- scan interval
+- scan resolution cap
+- scan crop ratio
+- duplicate payload skipping
+
+This keeps receiver UX simple while still adapting to fast or reliable sender profiles.
+
+## Retry and Integrity Flow
+
+1. Receiver validates each chunk using CRC32.
+2. Missing or corrupt chunks are tracked.
+3. Receiver can generate retry code (`R1:...`) that encodes missing chunk ranges.
+4. User pastes retry code into sender.
+5. Sender validates retry-code checksum and session, then resends only requested chunks.
+6. After reconstruction, receiver computes SHA-256 and compares with sender SHA-256.
+
+If SHA-256 mismatches, receiver requests retransmission.
+
+## Packet Format (Current)
+
+- Metadata packet: `M:...`
+- Data packet: `D:...`
+- Retry code: `R1:...`
+
+Metadata includes session and file integrity info.
+Data packet includes chunk index and CRC32.
+
+## Performance Notes
+
+- For weak cameras/displays, use `Reliable`.
+- For strong cameras/high-brightness displays, try `Fast` or `Aggressive`.
+- `Extreme` is best-effort/high-throughput and may require retry rounds.
+- Keep QR centered, avoid glare, and keep camera in focus.
+- Hard refresh both pages after pulling updates to avoid stale cached scripts.
+
+## Local Usage
 
 ```sh
 open generator.html
-```
-
-3. Open the `scanner.html` file in your browser for the receiver interface:
-
-```sh
 open scanner.html
 ```
 
-## Usage
-
-### Data Sender Mode
-
-1. Open `generator.html` in your browser.
-2. Select a file using the file input.
-3. Click the "Start Transfer" button to begin the transfer process.
-4. The application will compress the file, split it into chunks, and generate QR codes for each chunk.
-5. The generated QR codes will be displayed one by one, which can be scanned by the receiving device.
-
-### Data Receiver Mode
-
-1. Open `scanner.html` in your browser.
-2. Click the "Start Receiver" button to begin the receiving process.
-3. Use the device's camera to scan the QR codes generated by the sender.
-4. The application will decode the QR codes, reconstruct the file, and prompt you to download it once the transfer is complete.
-
-## How It Works
-
-### Data Sender (generator.html)
-
-1. **File Selection**: User selects a file from their device.
-2. **Compression**: The file is compressed using the pako library.
-3. **Chunking**: The compressed file is split into smaller chunks.
-4. **QR Code Generation**: Each chunk is encoded into a QR code using qrcode.js.
-5. **Display QR Codes**: The QR codes are displayed sequentially for the receiver to scan.
-
-### Data Receiver (scanner.html)
-
-1. **QR Code Scanning**: The device's camera scans QR codes using zbar-wasm.
-2. **Decoding**: Each QR code is decoded to extract the chunk of data.
-3. **Reconstruction**: The chunks are reassembled into the original compressed file.
-4. **Decompression**: The file is decompressed using pako.
-5. **File Download**: The reconstructed file is made available for download.
-
-## Contributing
-
-Contributions are welcome! Please follow these steps:
-
-1. Fork the repository.
-2. Create a new branch (`git checkout -b feature-branch`).
-3. Make your changes.
-4. Commit your changes (`git commit -am 'Add new feature'`).
-5. Push to the branch (`git push origin feature-branch`).
-6. Create a new Pull Request.
-
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License. See `LICENSE`.
 
 ## Acknowledgments
 
-- [Vue.js](https://vuejs.org/) - JavaScript framework for building user interfaces.
-- [pako](https://github.com/nodeca/pako) - Compression library.
-- [qrcode.js](https://github.com/davidshimjs/qrcodejs) - QR code generation library.
-- [zbar-wasm](https://github.com/undecaf/zbar-wasm) - QR code scanning library.
+- [Vue.js](https://vuejs.org/)
+- [pako](https://github.com/nodeca/pako)
+- [qrcode.js](https://github.com/davidshimjs/qrcodejs)
+- [zbar-wasm](https://github.com/undecaf/zbar-wasm)
