@@ -67,7 +67,7 @@
             v-model.trim="retry_code_input"
             class="block w-full text-sm text-gray-900 border border-gray-300 px-2 py-1 mb-2"
             type="text"
-            placeholder="R1:session:chunks:missing-ranges:crc"
+            placeholder="R2:session:missing-ranges:crc"
           />
           <button
             v-on:click="retry_missing_chunks"
@@ -102,6 +102,7 @@
           start_delay_ms: 500,
           compression_level: 2,
           metadata_repeat_count: 3,
+          metadata_heartbeat_interval: 140,
           initial_pass_repeat_count: 2,
           retry_repeat_count: 2,
           retry_high_loss_threshold: 0.14,
@@ -123,6 +124,7 @@
           start_delay_ms: 360,
           compression_level: 1,
           metadata_repeat_count: 2,
+          metadata_heartbeat_interval: 120,
           initial_pass_repeat_count: 1,
           retry_repeat_count: 2,
           retry_high_loss_threshold: 0.1,
@@ -144,6 +146,7 @@
           start_delay_ms: 240,
           compression_level: 0,
           metadata_repeat_count: 3,
+          metadata_heartbeat_interval: 100,
           initial_pass_repeat_count: 1,
           retry_repeat_count: 2,
           retry_high_loss_threshold: 0.08,
@@ -165,6 +168,7 @@
           start_delay_ms: 700,
           compression_level: 3,
           metadata_repeat_count: 4,
+          metadata_heartbeat_interval: 180,
           initial_pass_repeat_count: 3,
           retry_repeat_count: 2,
           retry_high_loss_threshold: 0.15,
@@ -186,6 +190,7 @@
           start_delay_ms: 900,
           compression_level: 4,
           metadata_repeat_count: 5,
+          metadata_heartbeat_interval: 220,
           initial_pass_repeat_count: 3,
           retry_repeat_count: 3,
           retry_high_loss_threshold: 0.18,
@@ -196,6 +201,7 @@
         },
       };
       const DEFAULT_PRESET_NAME = "Balanced";
+      const RETRY_CODE_EMPTY_PAYLOAD = "OK";
 
       const CRC32_TABLE = (() => {
         const table = new Uint32Array(256);
@@ -385,6 +391,14 @@
                     SENDER_PRESETS[DEFAULT_PRESET_NAME].metadata_repeat_count
                 )
               ),
+              metadata_heartbeat_interval: Math.floor(
+                Math.max(
+                  0,
+                  Number(selected_profile.metadata_heartbeat_interval) ||
+                    SENDER_PRESETS[DEFAULT_PRESET_NAME]
+                      .metadata_heartbeat_interval
+                )
+              ),
               initial_pass_repeat_count: Math.floor(
                 Math.max(
                   1,
@@ -442,7 +456,7 @@
             const config = get_sender_config();
             return `chunk=${config.initial_chunk_size}, safe=${Math.round(
               config.chunk_safety_ratio * 100
-            )}%, frame=${config.frame_interval_ms}ms, start=${config.start_delay_ms}ms, comp=${config.compression_level}, meta=${config.metadata_repeat_count}, init=${config.initial_pass_repeat_count}, retry=${config.retry_repeat_count}`;
+            )}%, frame=${config.frame_interval_ms}ms, start=${config.start_delay_ms}ms, comp=${config.compression_level}, meta=${config.metadata_repeat_count}, hb=${config.metadata_heartbeat_interval}, init=${config.initial_pass_repeat_count}, retry=${config.retry_repeat_count}`;
           });
 
           const get_initial_pass_repeat_count = (runtime_config, total_chunks) => {
@@ -505,7 +519,7 @@
 
           const encode_indices_to_ranges = (indices) => {
             if (!indices.length) {
-              return "NONE";
+              return RETRY_CODE_EMPTY_PAYLOAD;
             }
 
             const ordered = Array.from(new Set(indices)).sort((a, b) => a - b);
@@ -543,7 +557,7 @@
           };
 
           const decode_ranges_to_indices = (payload, total_chunks) => {
-            if (payload === "NONE") {
+            if (payload === RETRY_CODE_EMPTY_PAYLOAD || payload === "NONE") {
               return [];
             }
 
@@ -569,7 +583,7 @@
                 }
 
                 for (let value = start; value <= end; value++) {
-                  if (value < total_chunks) {
+                  if (!total_chunks || value < total_chunks) {
                     output.push(value);
                   }
                 }
@@ -578,7 +592,7 @@
                 if (!Number.isFinite(single) || single < 0) {
                   throw new Error("Retry code contains invalid index");
                 }
-                if (single < total_chunks) {
+                if (!total_chunks || single < total_chunks) {
                   output.push(single);
                 }
               }
@@ -587,9 +601,9 @@
             return Array.from(new Set(output)).sort((a, b) => a - b);
           };
 
-          const build_retry_code = (session_id, total_chunks, indices) => {
+          const build_retry_code = (session_id, indices) => {
             const payload = encode_indices_to_ranges(indices);
-            const body = `R1:${session_id}:${total_chunks}:${payload}`;
+            const body = `R2:${session_id}:${payload}`;
             const checksum = (crc32_text(body) & 0xffff)
               .toString(36)
               .toUpperCase()
@@ -597,32 +611,57 @@
             return `${body}:${checksum}`;
           };
 
-          const parse_retry_code = (input_code) => {
+          const parse_retry_code = (input_code, expected_total_chunks = 0) => {
             const parts = input_code.trim().split(":");
-            if (parts.length !== 5 || parts[0] !== "R1") {
-              throw new Error("Retry code format is invalid");
+            const retry_version = (parts[0] || "").toUpperCase();
+
+            if (retry_version === "R2") {
+              if (parts.length !== 4) {
+                throw new Error("Retry code format is invalid");
+              }
+              const body = parts.slice(0, 3).join(":");
+              const provided_checksum = parts[3].toUpperCase();
+              const expected_checksum = (crc32_text(body) & 0xffff)
+                .toString(36)
+                .toUpperCase()
+                .padStart(3, "0");
+              if (provided_checksum !== expected_checksum) {
+                throw new Error("Retry code checksum mismatch");
+              }
+              return {
+                session_id: parts[1],
+                total_chunks: expected_total_chunks,
+                indices: decode_ranges_to_indices(parts[2], expected_total_chunks),
+              };
             }
 
-            const body = parts.slice(0, 4).join(":");
-            const provided_checksum = parts[4].toUpperCase();
-            const expected_checksum = (crc32_text(body) & 0xffff)
-              .toString(36)
-              .toUpperCase()
-              .padStart(3, "0");
-            if (provided_checksum !== expected_checksum) {
-              throw new Error("Retry code checksum mismatch");
+            if (retry_version === "R1") {
+              if (parts.length !== 5) {
+                throw new Error("Retry code format is invalid");
+              }
+              const body = parts.slice(0, 4).join(":");
+              const provided_checksum = parts[4].toUpperCase();
+              const expected_checksum = (crc32_text(body) & 0xffff)
+                .toString(36)
+                .toUpperCase()
+                .padStart(3, "0");
+              if (provided_checksum !== expected_checksum) {
+                throw new Error("Retry code checksum mismatch");
+              }
+
+              const total_chunks = Number.parseInt(parts[2], 10);
+              if (!Number.isFinite(total_chunks) || total_chunks <= 0) {
+                throw new Error("Retry code total chunk count is invalid");
+              }
+
+              return {
+                session_id: parts[1],
+                total_chunks,
+                indices: decode_ranges_to_indices(parts[3], total_chunks),
+              };
             }
 
-            const total_chunks = Number.parseInt(parts[2], 10);
-            if (!Number.isFinite(total_chunks) || total_chunks <= 0) {
-              throw new Error("Retry code total chunk count is invalid");
-            }
-
-            return {
-              session_id: parts[1],
-              total_chunks,
-              indices: decode_ranges_to_indices(parts[3], total_chunks),
-            };
+            throw new Error("Retry code format is invalid");
           };
 
           const build_metadata_packet = (
@@ -741,6 +780,13 @@
 
                 show_qr_payload(packet);
                 sent_count += 1;
+                if (
+                  runtime_config.metadata_heartbeat_interval > 0 &&
+                  sent_count % runtime_config.metadata_heartbeat_interval === 0
+                ) {
+                  show_qr_payload(active_transfer.metadata_packet);
+                  await sleep(runtime_config.frame_interval_ms);
+                }
                 user_message.value = `${phase_label} round ${round + 1}/${rounds} chunk ${
                   chunk_index + 1
                 }/${active_transfer.total_chunks} (${i + 1}/${chunk_indices.length})`;
@@ -752,7 +798,6 @@
             if (sent_count > 0) {
               const expected_retry = build_retry_code(
                 active_transfer.session_id,
-                active_transfer.total_chunks,
                 []
               );
               user_message.value =
@@ -915,7 +960,10 @@
             }
 
             try {
-              const parsed = parse_retry_code(retry_code_input.value);
+              const parsed = parse_retry_code(
+                retry_code_input.value,
+                active_transfer.total_chunks
+              );
               if (parsed.session_id !== active_transfer.session_id) {
                 throw new Error("Retry code is for a different session");
               }

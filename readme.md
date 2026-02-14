@@ -24,6 +24,9 @@ The app is built with Vue.js and uses:
 - Chunk safety margin to avoid operating at fragile QR capacity limits
 - Large-transfer adaptive initial repeat boosting to avoid early-stall progress
 - Generator auto-fits and centers QR in viewport when transfer starts
+- Scanner stall watchdog with soft/hard auto-recovery
+- Metadata heartbeat injection during long sender passes
+- Simplified retry code format (`R2`) with backward-compatible sender parsing (`R1` still accepted)
 
 ## Quick Start
 
@@ -64,6 +67,7 @@ Common preset knobs:
 - `chunk_safety_ratio`: keeps effective chunk payload below edge capacity for better decode reliability
 - `frame_interval_ms`, `start_delay_ms`: pacing controls
 - `metadata_repeat_count`, `initial_pass_repeat_count`, `retry_repeat_count`: baseline redundancy
+- `metadata_heartbeat_interval`: inject metadata frame every N data packets to help scanner re-lock mid-pass
 - `large_transfer_chunk_threshold`, `large_transfer_repeat_boost`: add initial-pass repeats when chunk count is high
 - `very_large_transfer_chunk_threshold`, `very_large_transfer_repeat_boost`: add more repeats for very large transfers
 - `max_initial_pass_repeat_count`: cap auto-boosted initial-pass repeats
@@ -86,7 +90,7 @@ This keeps receiver UX simple while still adapting to fast or reliable sender pr
 
 1. Receiver validates each chunk using CRC32.
 2. Missing or corrupt chunks are tracked.
-3. Receiver can generate retry code (`R1:...`) that encodes missing chunk ranges.
+3. Receiver generates compact retry code (`R2:session:ranges:crc`) for missing chunk ranges.
 4. User pastes retry code into sender.
 5. Sender validates retry-code checksum and session, then resends only requested chunks.
 6. If missing ratio is high, sender auto-applies retry backoff (slower cadence + extra redundancy) for that retry round.
@@ -100,7 +104,7 @@ If SHA-256 mismatches, receiver requests retransmission.
 
 - Metadata packet: `M:...`
 - Data packet: `D:...`
-- Retry code: `R1:...`
+- Retry code: `R2:...` (sender accepts legacy `R1:...` too)
 
 Metadata includes session and file integrity info.
 Data packet includes chunk index and CRC32.

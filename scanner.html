@@ -78,6 +78,13 @@
         scan_crop_ratio: 1,
         skip_duplicate_payloads: true,
       };
+      const RETRY_CODE_EMPTY_PAYLOAD = "OK";
+      const SCANNER_RESILIENCE = {
+        decode_timeout_ms: 120,
+        max_consecutive_decode_timeouts: 8,
+        stall_soft_ms: 2500,
+        stall_hard_ms: 7000,
+      };
 
       const CRC32_TABLE = (() => {
         const table = new Uint32Array(256);
@@ -111,12 +118,45 @@
           const corrupt_chunk_count = ref(0);
           const is_receiving = ref(false);
           let canvas, context, videoElement;
+          let media_stream = null;
           let last_decoded_payload = "";
           let chunk_store = [];
           let received_index_set = new Set();
           let scan_source_rect = { x: 0, y: 0, width: 0, height: 0 };
 
           const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+          const stop_camera_stream = () => {
+            if (!media_stream) {
+              return;
+            }
+            for (const track of media_stream.getTracks()) {
+              track.stop();
+            }
+            media_stream = null;
+          };
+
+          const attach_camera_stream = async (restart = false) => {
+            if (restart) {
+              stop_camera_stream();
+            }
+            if (!media_stream) {
+              media_stream = await navigator.mediaDevices.getUserMedia({
+                video: { facingMode: "environment" },
+              });
+            }
+            videoElement.srcObject = media_stream;
+            await sleep(250);
+          };
+
+          const scan_image_with_timeout = (image_data, timeout_ms) => {
+            return Promise.race([
+              zbarWasm.scanImageData(image_data),
+              new Promise((_resolve, reject) => {
+                setTimeout(() => reject(new Error("SCAN_TIMEOUT")), timeout_ms);
+              }),
+            ]);
+          };
 
           const get_scanner_config = () => {
             return {
@@ -372,7 +412,7 @@
 
           const encode_indices_to_ranges = (indices) => {
             if (!indices.length) {
-              return "NONE";
+              return RETRY_CODE_EMPTY_PAYLOAD;
             }
 
             const ordered = Array.from(new Set(indices)).sort((a, b) => a - b);
@@ -409,9 +449,9 @@
             return ranges.join(".");
           };
 
-          const build_retry_code = (session_id, total_chunks, indices) => {
+          const build_retry_code = (session_id, indices) => {
             const payload = encode_indices_to_ranges(indices);
-            const body = `R1:${session_id}:${total_chunks}:${payload}`;
+            const body = `R2:${session_id}:${payload}`;
             const checksum = (crc32_text(body) & 0xffff)
               .toString(36)
               .toUpperCase()
@@ -466,7 +506,6 @@
 
             retry_code.value = build_retry_code(
               file_metadata.session_id,
-              file_metadata.chunks,
               get_missing_indices()
             );
             user_message.value =
@@ -507,10 +546,47 @@
             reset_transfer_state();
             is_receiving.value = true;
             let runtime_config = get_scanner_config();
+
+            let last_scan_activity_ts = Date.now();
+            let last_new_chunk_ts = Date.now();
+            let last_soft_recovery_ts = 0;
+            let consecutive_scan_timeouts = 0;
+            let last_loop_error_log_ts = 0;
+
+            const apply_soft_recovery = () => {
+              last_decoded_payload = "";
+              auto_scan_profile.scan_crop_ratio = Math.min(
+                1,
+                Number(auto_scan_profile.scan_crop_ratio) + 0.1
+              );
+              runtime_config = get_scanner_config();
+              configure_scan_canvas(runtime_config);
+              user_message.value = "Scanner stall detected, re-locking...";
+            };
+
+            const apply_hard_recovery = async (reason) => {
+              user_message.value = `Scanner stalled (${reason}), restarting camera...`;
+              last_decoded_payload = "";
+              await attach_camera_stream(true);
+              runtime_config = get_scanner_config();
+              if (!configure_scan_canvas(runtime_config)) {
+                throw new Error("Camera did not return a readable frame");
+              }
+              last_scan_activity_ts = Date.now();
+              last_new_chunk_ts = Date.now();
+              last_soft_recovery_ts = 0;
+              consecutive_scan_timeouts = 0;
+            };
+
             if (!configure_scan_canvas(runtime_config)) {
-              user_message.value = "Camera is still initializing. Try again.";
-              is_receiving.value = false;
-              return;
+              try {
+                await apply_hard_recovery("camera sync");
+              } catch (error) {
+                console.error(error);
+                user_message.value = "Camera is still initializing. Try again.";
+                is_receiving.value = false;
+                return;
+              }
             }
 
             while (is_receiving.value) {
@@ -519,6 +595,37 @@
                 received_chunk_count.value === file_metadata.chunks
               ) {
                 break;
+              }
+
+              const now = Date.now();
+              const has_active_session =
+                Boolean(file_metadata.session_id) && file_metadata.chunks > 0;
+              if (has_active_session) {
+                const no_progress_ms = now - last_new_chunk_ts;
+                const inactivity_ms = now - last_scan_activity_ts;
+                if (
+                  no_progress_ms >= SCANNER_RESILIENCE.stall_hard_ms &&
+                  inactivity_ms >= Math.floor(SCANNER_RESILIENCE.stall_hard_ms * 0.5)
+                ) {
+                  try {
+                    await apply_hard_recovery("no progress");
+                  } catch (error) {
+                    console.error(error);
+                    user_message.value =
+                      "Scanner recovery failed. Generate retry code and restart receiver.";
+                    is_receiving.value = false;
+                    return;
+                  }
+                  continue;
+                }
+                if (
+                  no_progress_ms >= SCANNER_RESILIENCE.stall_soft_ms &&
+                  inactivity_ms >= Math.floor(SCANNER_RESILIENCE.stall_soft_ms * 0.5) &&
+                  now - last_soft_recovery_ts >= SCANNER_RESILIENCE.stall_soft_ms
+                ) {
+                  apply_soft_recovery();
+                  last_soft_recovery_ts = now;
+                }
               }
 
               try {
@@ -541,12 +648,17 @@
                   canvas.width,
                   canvas.height
                 );
-                const symbols = await zbarWasm.scanImageData(image_data);
+                const symbols = await scan_image_with_timeout(
+                  image_data,
+                  SCANNER_RESILIENCE.decode_timeout_ms
+                );
+                consecutive_scan_timeouts = 0;
                 if (!symbols || !symbols.length) {
                   continue;
                 }
 
                 const decoded_data = symbols[0].decode();
+                last_scan_activity_ts = Date.now();
                 if (
                   runtime_config.skip_duplicate_payloads &&
                   decoded_data === last_decoded_payload
@@ -565,6 +677,7 @@
                     receiver_file_sha256.value = "";
                     integrity_status.value = "";
                     corrupt_chunk_count.value = 0;
+                    last_new_chunk_ts = Date.now();
                   }
                   file_metadata.session_id = metadata_packet.session_id;
                   file_metadata.name = metadata_packet.name;
@@ -621,8 +734,32 @@
                 received_index_set.add(data_packet.index);
                 chunk_store[data_packet.index] = chunk_data;
                 received_chunk_count.value = received_index_set.size;
+                last_new_chunk_ts = Date.now();
+                last_scan_activity_ts = last_new_chunk_ts;
               } catch (error) {
-                console.error("Error in Loop: ", error);
+                if (error && error.message === "SCAN_TIMEOUT") {
+                  consecutive_scan_timeouts += 1;
+                  if (
+                    consecutive_scan_timeouts >=
+                    SCANNER_RESILIENCE.max_consecutive_decode_timeouts
+                  ) {
+                    try {
+                      await apply_hard_recovery("decode timeout");
+                    } catch (hard_error) {
+                      console.error(hard_error);
+                      user_message.value =
+                        "Scanner recovery failed. Generate retry code and restart receiver.";
+                      is_receiving.value = false;
+                      return;
+                    }
+                  }
+                  continue;
+                }
+                const log_now = Date.now();
+                if (log_now - last_loop_error_log_ts > 2000) {
+                  console.error("Error in Loop: ", error);
+                  last_loop_error_log_ts = log_now;
+                }
               }
             }
 
@@ -668,7 +805,6 @@
                 );
                 retry_code.value = build_retry_code(
                   file_metadata.session_id,
-                  file_metadata.chunks,
                   full_retransmit_indices
                 );
                 is_receiving.value = false;
@@ -678,7 +814,6 @@
               integrity_status.value = "MATCH";
               retry_code.value = build_retry_code(
                 file_metadata.session_id,
-                file_metadata.chunks,
                 []
               );
               download_file(inflated_array, file_metadata.name);
@@ -696,12 +831,10 @@
           onMounted(async () => {
             console.log("Application Initialized ...");
             videoElement = document.getElementById("videoElement");
-            videoElement.srcObject = await navigator.mediaDevices.getUserMedia({
-              video: { facingMode: "environment" },
-            });
+            await attach_camera_stream();
             canvas = document.createElement("canvas");
             context = canvas.getContext("2d");
-            await new Promise((r) => setTimeout(r, 2000));
+            await sleep(800);
             const runtime_config = get_scanner_config();
             if (configure_scan_canvas(runtime_config)) {
               context.drawImage(
