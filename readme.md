@@ -19,6 +19,10 @@ The app is built with Vue.js and uses:
 - Per-chunk CRC32 validation on receiver
 - End-to-end SHA-256 verification for final file integrity
 - Duplicate packet suppression and optimized chunk storage for better long-run performance
+- Interleaved chunk repeats (`A B C ... A B C ...`) to reduce burst-loss impact
+- Retry backoff for high-loss rounds (slower but more robust retries when needed)
+- Chunk safety margin to avoid operating at fragile QR capacity limits
+- Large-transfer adaptive initial repeat boosting to avoid early-stall progress
 
 ## Quick Start
 
@@ -53,6 +57,18 @@ Presets are defined in `generator.html` under:
 
 Update these objects to customize profile behavior for your hardware.
 
+Common preset knobs:
+- `initial_chunk_size`, `min_chunk_size`: payload sizing bounds
+- `chunk_safety_ratio`: keeps effective chunk payload below edge capacity for better decode reliability
+- `frame_interval_ms`, `start_delay_ms`: pacing controls
+- `metadata_repeat_count`, `initial_pass_repeat_count`, `retry_repeat_count`: baseline redundancy
+- `large_transfer_chunk_threshold`, `large_transfer_repeat_boost`: add initial-pass repeats when chunk count is high
+- `very_large_transfer_chunk_threshold`, `very_large_transfer_repeat_boost`: add more repeats for very large transfers
+- `max_initial_pass_repeat_count`: cap auto-boosted initial-pass repeats
+- `retry_high_loss_threshold`: missing-ratio trigger for safer retry mode
+- `retry_high_loss_frame_multiplier`, `retry_high_loss_start_delay_multiplier`: retry pacing backoff multipliers
+- `retry_high_loss_metadata_extra`, `retry_high_loss_repeat_increment`: extra redundancy added only for high-loss retries
+
 ## Scanner Auto-Negotiation
 
 Scanner has no manual performance form now.
@@ -71,7 +87,10 @@ This keeps receiver UX simple while still adapting to fast or reliable sender pr
 3. Receiver can generate retry code (`R1:...`) that encodes missing chunk ranges.
 4. User pastes retry code into sender.
 5. Sender validates retry-code checksum and session, then resends only requested chunks.
-6. After reconstruction, receiver computes SHA-256 and compares with sender SHA-256.
+6. If missing ratio is high, sender auto-applies retry backoff (slower cadence + extra redundancy) for that retry round.
+7. After reconstruction, receiver computes SHA-256 and compares with sender SHA-256.
+
+For large transfers, sender may also automatically increase initial interleaved repeat rounds based on total chunk count.
 
 If SHA-256 mismatches, receiver requests retransmission.
 
@@ -89,6 +108,7 @@ Data packet includes chunk index and CRC32.
 - For weak cameras/displays, use `Reliable`.
 - For strong cameras/high-brightness displays, try `Fast` or `Aggressive`.
 - `Extreme` is best-effort/high-throughput and may require retry rounds.
+- If `Extreme` shows notable loss, rely on retry backoff or reduce `chunk_safety_ratio`/increase `frame_interval_ms` in preset tuning.
 - Keep QR centered, avoid glare, and keep camera in focus.
 - Hard refresh both pages after pulling updates to avoid stale cached scripts.
 
