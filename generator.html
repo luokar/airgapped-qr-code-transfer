@@ -75,11 +75,18 @@
           >
             Resend Missing Chunks
           </button>
+          <div
+            v-if="retry_feedback"
+            class="mt-2 text-xs"
+            :class="retry_feedback_is_error ? 'text-red-700' : 'text-green-700'"
+          >
+            {{retry_feedback}}
+          </div>
         </div>
         <div id="qrcode" class=""></div>
         <div
           v-if="is_transferring && transfer_progress.expected_packets > 0"
-          class="fixed bottom-3 left-1/2 -translate-x-1/2 bg-white/90 border border-gray-400 px-3 py-2 text-xs z-50"
+          class="fixed top-2 left-2 bg-white/90 border border-gray-400 px-3 py-2 text-xs z-50 pointer-events-none"
         >
           <div>
             {{transfer_progress.phase}} {{transfer_progress_percent}}% | Packet
@@ -233,6 +240,8 @@
           const user_message = ref("Choose file to get started");
           const is_transferring = ref(false);
           const retry_code_input = ref("");
+          const retry_feedback = ref("");
+          const retry_feedback_is_error = ref(false);
           const selected_preset = ref(DEFAULT_PRESET_NAME);
           const preset_names = Object.keys(SENDER_PRESETS);
           const transfer_summary = reactive({
@@ -552,6 +561,39 @@
             return uint8_to_base64(encoded);
           };
 
+          const create_retry_code_error = (reason, message) => {
+            const error = new Error(message);
+            error.retry_code_reason = reason;
+            return error;
+          };
+
+          const format_retry_code_error = (error) => {
+            if (!error || !error.retry_code_reason) {
+              return `Invalid retry code: ${error && error.message ? error.message : "Unknown error"}`;
+            }
+
+            if (error.retry_code_reason === "format_invalid") {
+              return "Invalid retry code format. Expected R2:session:ranges:crc.";
+            }
+            if (error.retry_code_reason === "checksum_mismatch") {
+              return "Retry code checksum mismatch. Re-copy it from scanner.";
+            }
+            if (error.retry_code_reason === "range_invalid") {
+              return "Retry code contains invalid missing ranges.";
+            }
+            if (error.retry_code_reason === "chunk_total_invalid") {
+              return "Retry code contains invalid chunk total.";
+            }
+            if (error.retry_code_reason === "session_mismatch") {
+              return "Retry code belongs to a different transfer session.";
+            }
+            if (error.retry_code_reason === "chunk_count_mismatch") {
+              return "Retry code chunk count does not match current transfer.";
+            }
+
+            return `Invalid retry code: ${error.message}`;
+          };
+
           const encode_indices_to_ranges = (indices) => {
             if (!indices.length) {
               return RETRY_CODE_EMPTY_PAYLOAD;
@@ -614,7 +656,10 @@
                   start < 0 ||
                   end < start
                 ) {
-                  throw new Error("Retry code contains invalid range");
+                  throw create_retry_code_error(
+                    "range_invalid",
+                    "Retry code contains invalid range"
+                  );
                 }
 
                 for (let value = start; value <= end; value++) {
@@ -625,7 +670,10 @@
               } else {
                 const single = Number.parseInt(segment, 36);
                 if (!Number.isFinite(single) || single < 0) {
-                  throw new Error("Retry code contains invalid index");
+                  throw create_retry_code_error(
+                    "range_invalid",
+                    "Retry code contains invalid index"
+                  );
                 }
                 if (!total_chunks || single < total_chunks) {
                   output.push(single);
@@ -652,7 +700,16 @@
 
             if (retry_version === "R2") {
               if (parts.length !== 4) {
-                throw new Error("Retry code format is invalid");
+                throw create_retry_code_error(
+                  "format_invalid",
+                  "Retry code format is invalid"
+                );
+              }
+              if (!parts[1]) {
+                throw create_retry_code_error(
+                  "format_invalid",
+                  "Retry code session is missing"
+                );
               }
               const body = parts.slice(0, 3).join(":");
               const provided_checksum = parts[3].toUpperCase();
@@ -661,7 +718,10 @@
                 .toUpperCase()
                 .padStart(3, "0");
               if (provided_checksum !== expected_checksum) {
-                throw new Error("Retry code checksum mismatch");
+                throw create_retry_code_error(
+                  "checksum_mismatch",
+                  "Retry code checksum mismatch"
+                );
               }
               return {
                 session_id: parts[1],
@@ -672,7 +732,16 @@
 
             if (retry_version === "R1") {
               if (parts.length !== 5) {
-                throw new Error("Retry code format is invalid");
+                throw create_retry_code_error(
+                  "format_invalid",
+                  "Retry code format is invalid"
+                );
+              }
+              if (!parts[1]) {
+                throw create_retry_code_error(
+                  "format_invalid",
+                  "Retry code session is missing"
+                );
               }
               const body = parts.slice(0, 4).join(":");
               const provided_checksum = parts[4].toUpperCase();
@@ -681,12 +750,18 @@
                 .toUpperCase()
                 .padStart(3, "0");
               if (provided_checksum !== expected_checksum) {
-                throw new Error("Retry code checksum mismatch");
+                throw create_retry_code_error(
+                  "checksum_mismatch",
+                  "Retry code checksum mismatch"
+                );
               }
 
               const total_chunks = Number.parseInt(parts[2], 10);
               if (!Number.isFinite(total_chunks) || total_chunks <= 0) {
-                throw new Error("Retry code total chunk count is invalid");
+                throw create_retry_code_error(
+                  "chunk_total_invalid",
+                  "Retry code total chunk count is invalid"
+                );
               }
 
               return {
@@ -696,7 +771,10 @@
               };
             }
 
-            throw new Error("Retry code format is invalid");
+            throw create_retry_code_error(
+              "format_invalid",
+              "Retry code format is invalid"
+            );
           };
 
           const build_metadata_packet = (
@@ -857,6 +935,7 @@
           const stop_transfer = () => {
             is_transferring.value = false;
             transfer_progress.phase = "Paused";
+            retry_feedback.value = "";
             user_message.value = transfer_summary.ready
               ? "Transfer paused. Paste retry code to continue."
               : "Choose file to get started";
@@ -873,6 +952,7 @@
             }
 
             is_transferring.value = true;
+            retry_feedback.value = "";
             transfer_progress.phase = "Preparing";
             transfer_progress.current_chunk = 0;
             transfer_progress.total_chunks = 0;
@@ -1004,13 +1084,19 @@
           const retry_missing_chunks = async () => {
             if (!transfer_summary.ready || !active_transfer) {
               user_message.value = "Start a transfer before applying retry code";
+              retry_feedback.value = "Start a transfer before applying retry code.";
+              retry_feedback_is_error.value = true;
               return;
             }
 
             const runtime_config = get_sender_config();
+            retry_feedback.value = "";
+            retry_feedback_is_error.value = false;
 
             if (!retry_code_input.value) {
               user_message.value = "Paste retry code from receiver";
+              retry_feedback.value = "Paste retry code from receiver.";
+              retry_feedback_is_error.value = true;
               return;
             }
 
@@ -1020,16 +1106,25 @@
                 active_transfer.total_chunks
               );
               if (parsed.session_id !== active_transfer.session_id) {
-                throw new Error("Retry code is for a different session");
+                throw create_retry_code_error(
+                  "session_mismatch",
+                  "Retry code is for a different session"
+                );
               }
 
               if (parsed.total_chunks !== active_transfer.total_chunks) {
-                throw new Error("Retry code chunk count does not match sender");
+                throw create_retry_code_error(
+                  "chunk_count_mismatch",
+                  "Retry code chunk count does not match sender"
+                );
               }
 
               if (!parsed.indices.length) {
                 user_message.value =
                   "Receiver reports no missing chunks. Verify checksum on receiver.";
+                retry_feedback.value =
+                  "Code is valid. Receiver reports no missing chunks.";
+                retry_feedback_is_error.value = false;
                 return;
               }
 
@@ -1060,15 +1155,25 @@
                 "Retrying",
                 adjusted_runtime_config
               );
+              retry_feedback.value =
+                "Retry code accepted. Resending only missing chunks.";
+              retry_feedback_is_error.value = false;
             } catch (error) {
               console.error(error);
-              user_message.value = `Invalid retry code: ${error.message}`;
+              const friendly_message = format_retry_code_error(error);
+              retry_feedback.value = friendly_message;
+              retry_feedback_is_error.value = true;
+              user_message.value = friendly_message;
             }
           };
 
           onMounted(() => {
             console.log("Application Initialized ...");
             fit_qr_to_viewport(true);
+            watch(retry_code_input, () => {
+              retry_feedback.value = "";
+              retry_feedback_is_error.value = false;
+            });
             watch(
               is_transferring,
               (value) => {
@@ -1093,6 +1198,8 @@
             stop_transfer,
             is_transferring,
             retry_code_input,
+            retry_feedback,
+            retry_feedback_is_error,
             retry_missing_chunks,
             transfer_summary,
             transfer_progress,
