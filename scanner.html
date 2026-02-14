@@ -15,8 +15,20 @@
         <div class="text-xl my-4">Data Receiver Mode</div>
         <div class="text-sm mb-4">{{user_message}}</div>
         <div class="text-sm mb-4">
-          Progress: {{Object.keys(decoded_chunks).length}} /
-          {{file_metadata.chunks || 0}}
+          Progress: {{received_chunk_count}} / {{file_metadata.chunks || 0}}
+        </div>
+        <div class="text-sm mb-2">Missing Chunks: {{missing_chunk_count}}</div>
+        <div v-if="file_metadata.file_sha256" class="text-sm mb-2">
+          Sender SHA256: {{short_checksum(file_metadata.file_sha256)}}
+        </div>
+        <div v-if="receiver_file_sha256" class="text-sm mb-2">
+          Receiver SHA256: {{short_checksum(receiver_file_sha256)}}
+        </div>
+        <div v-if="integrity_status" class="text-sm mb-2">
+          Integrity: {{integrity_status}}
+        </div>
+        <div v-if="corrupt_chunk_count > 0" class="text-sm mb-2">
+          Corrupt Chunks Rejected: {{corrupt_chunk_count}}
         </div>
         <button
           v-if="!is_receiving"
@@ -32,6 +44,25 @@
         >
           Stop Receiver
         </button>
+        <div
+          v-show="file_metadata.session_id && file_metadata.chunks > 0"
+          class="w-3/4 mt-4"
+        >
+          <button
+            v-on:click="generate_retry_code"
+            class="mb-2 p-1 border-2 border-gray-500 text-sm"
+          >
+            Generate Retry Code
+          </button>
+          <button
+            v-if="retry_code"
+            v-on:click="copy_retry_code"
+            class="mb-2 ml-2 p-1 border-2 border-gray-500 text-sm"
+          >
+            Copy Retry Code
+          </button>
+          <div v-if="retry_code" class="text-xs break-all mb-2">{{retry_code}}</div>
+        </div>
         <video id="videoElement" muted autoplay playsinline></video>
       </div>
     </div>
@@ -39,33 +70,298 @@
     <script src="https://cdn.jsdelivr.net/npm/@undecaf/zbar-wasm@latest/dist/index.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.0.3/pako.min.js"></script>
     <script>
-      const { createApp, ref, reactive, onMounted, computed } = Vue;
+      const { createApp, ref, reactive, computed, onMounted } = Vue;
+
+      const SCAN_INTERVAL_MS = 15;
+      const SCAN_MAX_DIMENSION = 720;
+
+      const CRC32_TABLE = (() => {
+        const table = new Uint32Array(256);
+        for (let i = 0; i < 256; i++) {
+          let crc = i;
+          for (let j = 0; j < 8; j++) {
+            crc = (crc & 1) ? 0xedb88320 ^ (crc >>> 1) : crc >>> 1;
+          }
+          table[i] = crc >>> 0;
+        }
+        return table;
+      })();
 
       createApp({
         setup() {
           const user_message = ref("Click receive button to start receiving");
-          const decoded_chunks = ref({});
-          const total_chunks = ref(-1);
-          const file_metadata = reactive({});
+          const received_chunk_count = ref(0);
+          const file_metadata = reactive({
+            session_id: "",
+            name: "",
+            chunks: 0,
+            compressed_length: 0,
+            file_size: 0,
+            file_sha256: "",
+          });
+          const retry_code = ref("");
+          const receiver_file_sha256 = ref("");
+          const integrity_status = ref("");
+          const corrupt_chunk_count = ref(0);
           const is_receiving = ref(false);
           let canvas, context, videoElement;
+          let last_decoded_payload = "";
+          let chunk_store = [];
+          let received_index_set = new Set();
 
-          const decode_data = (input_string) => {
-            const encoded_data = atob(input_string.split(",")[1]);
-            const encoded_array = Array.from(encoded_data, (char) =>
-              char.charCodeAt(0)
-            );
-            const utf8Decoder = new TextDecoder();
-            const output_string = utf8Decoder.decode(
-              new Uint8Array(encoded_array)
-            );
-            const data_array = Array.from(output_string, (char) =>
-              char.charCodeAt(0)
-            );
+          const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+          const crc32_bytes = (bytes) => {
+            let crc = 0xffffffff;
+            for (let i = 0; i < bytes.length; i++) {
+              crc = CRC32_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+            }
+            return (crc ^ 0xffffffff) >>> 0;
+          };
+
+          const crc32_text = (value) => {
+            return crc32_bytes(new TextEncoder().encode(value));
+          };
+
+          const short_checksum = (value) => {
+            if (!value) {
+              return "-";
+            }
+            return value.slice(0, 16).toUpperCase();
+          };
+
+          const sha256_hex = async (bytes) => {
+            if (!window.crypto || !window.crypto.subtle) {
+              throw new Error("SHA-256 not available in this browser context");
+            }
+            const digest = await window.crypto.subtle.digest("SHA-256", bytes);
+            const output = Array.from(new Uint8Array(digest));
+            return output
+              .map((value) => value.toString(16).padStart(2, "0"))
+              .join("");
+          };
+
+          const base64_to_uint8 = (value) => {
+            const binary = atob(value);
+            const output = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) {
+              output[i] = binary.charCodeAt(i);
+            }
+            return output;
+          };
+
+          const base64_to_text = (value) => {
+            return new TextDecoder().decode(base64_to_uint8(value));
+          };
+
+          const parse_metadata_packet = (input_string) => {
+            if (!input_string.startsWith("M:")) {
+              // Backward compatibility for old metadata payloads.
+              if (input_string.startsWith("{")) {
+                try {
+                  const parsed = JSON.parse(input_string);
+                  if (!parsed || !parsed.chunks) {
+                    return null;
+                  }
+                  return {
+                    session_id: `legacy-${(crc32_text(
+                      `${parsed.name || "transfer.bin"}:${parsed.chunks}`
+                    ) & 0xffff)
+                      .toString(36)
+                      .toUpperCase()}`,
+                    chunks: parsed.chunks,
+                    name: parsed.name || "transfer.bin",
+                    compressed_length: 0,
+                    file_size: 0,
+                    file_sha256: "",
+                  };
+                } catch (_error) {
+                  return null;
+                }
+              }
+              return null;
+            }
+            const parts = input_string.split(":");
+            if (parts.length !== 7) {
+              return null;
+            }
+
+            const chunks = Number.parseInt(parts[2], 10);
+            const compressed_length = Number.parseInt(parts[3], 10);
+            const file_size = Number.parseInt(parts[4], 10);
+            if (!Number.isFinite(chunks) || chunks <= 0) {
+              return null;
+            }
+
             return {
-              index: parseInt(input_string.split(",")[0]),
-              data: data_array,
+              session_id: parts[1],
+              chunks,
+              name: base64_to_text(parts[6]),
+              compressed_length: Number.isFinite(compressed_length)
+                ? compressed_length
+                : 0,
+              file_size: Number.isFinite(file_size) ? file_size : 0,
+              file_sha256: parts[5],
             };
+          };
+
+          const parse_data_packet = (input_string) => {
+            if (!input_string.startsWith("D:")) {
+              // Backward compatibility for old data payloads: "index,base64".
+              if (input_string.split(",").length === 2) {
+                const parts = input_string.split(",");
+                const legacy_index = Number.parseInt(parts[0], 10);
+                if (!Number.isFinite(legacy_index) || legacy_index < 0) {
+                  return null;
+                }
+                const legacy_data = base64_to_uint8(parts[1]);
+                return {
+                  session_id: file_metadata.session_id || "legacy",
+                  index: legacy_index,
+                  total: file_metadata.chunks || 0,
+                  chunk_crc: crc32_bytes(legacy_data)
+                    .toString(16)
+                    .toUpperCase()
+                    .padStart(8, "0"),
+                  data: legacy_data,
+                };
+              }
+              return null;
+            }
+            const parts = input_string.split(":");
+            if (parts.length !== 6) {
+              return null;
+            }
+
+            const index = Number.parseInt(parts[2], 10);
+            const total = Number.parseInt(parts[3], 10);
+            if (!Number.isFinite(index) || !Number.isFinite(total) || total <= 0) {
+              return null;
+            }
+
+            return {
+              session_id: parts[1],
+              index,
+              total,
+              chunk_crc: parts[4].toUpperCase(),
+              data_base64: parts[5],
+            };
+          };
+
+          const encode_indices_to_ranges = (indices) => {
+            if (!indices.length) {
+              return "NONE";
+            }
+
+            const ordered = Array.from(new Set(indices)).sort((a, b) => a - b);
+            const ranges = [];
+            let start = ordered[0];
+            let previous = ordered[0];
+
+            for (let i = 1; i < ordered.length; i++) {
+              const current = ordered[i];
+              if (current === previous + 1) {
+                previous = current;
+                continue;
+              }
+
+              ranges.push(
+                start === previous
+                  ? start.toString(36).toUpperCase()
+                  : `${start.toString(36).toUpperCase()}-${previous
+                      .toString(36)
+                      .toUpperCase()}`
+              );
+              start = current;
+              previous = current;
+            }
+
+            ranges.push(
+              start === previous
+                ? start.toString(36).toUpperCase()
+                : `${start.toString(36).toUpperCase()}-${previous
+                    .toString(36)
+                    .toUpperCase()}`
+            );
+
+            return ranges.join(".");
+          };
+
+          const build_retry_code = (session_id, total_chunks, indices) => {
+            const payload = encode_indices_to_ranges(indices);
+            const body = `R1:${session_id}:${total_chunks}:${payload}`;
+            const checksum = (crc32_text(body) & 0xffff)
+              .toString(36)
+              .toUpperCase()
+              .padStart(3, "0");
+            return `${body}:${checksum}`;
+          };
+
+          const get_missing_indices = () => {
+            if (!file_metadata.chunks) {
+              return [];
+            }
+
+            const output = [];
+            for (let i = 0; i < file_metadata.chunks; i++) {
+              if (!received_index_set.has(i)) {
+                output.push(i);
+              }
+            }
+            return output;
+          };
+
+          const missing_chunk_count = computed(() => {
+            if (!file_metadata.chunks) {
+              return 0;
+            }
+            return Math.max(0, file_metadata.chunks - received_chunk_count.value);
+          });
+
+          const reset_transfer_state = () => {
+            chunk_store = [];
+            received_index_set = new Set();
+            received_chunk_count.value = 0;
+            file_metadata.session_id = "";
+            file_metadata.name = "";
+            file_metadata.chunks = 0;
+            file_metadata.compressed_length = 0;
+            file_metadata.file_size = 0;
+            file_metadata.file_sha256 = "";
+            retry_code.value = "";
+            receiver_file_sha256.value = "";
+            integrity_status.value = "";
+            corrupt_chunk_count.value = 0;
+            last_decoded_payload = "";
+          };
+
+          const generate_retry_code = () => {
+            if (!file_metadata.session_id || !file_metadata.chunks) {
+              user_message.value = "No active session yet";
+              return;
+            }
+
+            retry_code.value = build_retry_code(
+              file_metadata.session_id,
+              file_metadata.chunks,
+              get_missing_indices()
+            );
+            user_message.value =
+              "Share retry code with sender. Sender can resend only missing chunks.";
+          };
+
+          const copy_retry_code = async () => {
+            if (!retry_code.value) {
+              return;
+            }
+
+            try {
+              await navigator.clipboard.writeText(retry_code.value);
+              user_message.value = "Retry code copied";
+            } catch (error) {
+              console.error(error);
+              user_message.value = "Unable to copy. Please copy retry code manually";
+            }
           };
 
           const download_file = (data, fileName) => {
@@ -80,60 +376,174 @@
 
           const stop_receiver = () => {
             is_receiving.value = false;
-            decoded_chunks.value = {};
-            Object.assign(file_metadata, {});
+            reset_transfer_state();
             user_message.value = "Click receive button to start receiving";
           };
 
           const start_receiver = async () => {
-            decoded_chunks.value = {};
+            reset_transfer_state();
             is_receiving.value = true;
-            while (
-              file_metadata.chunks != Object.keys(decoded_chunks.value).length
-            ) {
+
+            while (is_receiving.value) {
+              if (
+                file_metadata.chunks > 0 &&
+                received_chunk_count.value === file_metadata.chunks
+              ) {
+                break;
+              }
+
               try {
-                await new Promise((r) => setTimeout(r, 10));
-                context.drawImage(videoElement, 0, 0);
-                image_data = context.getImageData(
+                await sleep(SCAN_INTERVAL_MS);
+                context.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
+                const image_data = context.getImageData(
                   0,
                   0,
                   canvas.width,
                   canvas.height
                 );
-                let symbols = await zbarWasm.scanImageData(image_data);
+                const symbols = await zbarWasm.scanImageData(image_data);
                 if (!symbols || !symbols.length) {
                   continue;
                 }
-                let decoded_data = symbols[0].decode();
-                if (decoded_data.includes("chunks")) {
-                  Object.assign(file_metadata, JSON.parse(decoded_data));
-                  decoded_chunks.value = {};
-                  user_message.value = `Transferring file: ${file_metadata.name}`;
-                } else if (decoded_data.split(",").length == 2) {
-                  let raw_data = decode_data(decoded_data);
-                  decoded_chunks.value[raw_data["index"]] = raw_data["data"];
+
+                const decoded_data = symbols[0].decode();
+                if (decoded_data === last_decoded_payload) {
+                  continue;
                 }
-                window.decoded_chunks = decoded_chunks.value;
+                last_decoded_payload = decoded_data;
+
+                const metadata_packet = parse_metadata_packet(decoded_data);
+                if (metadata_packet) {
+                  if (metadata_packet.session_id !== file_metadata.session_id) {
+                    chunk_store = [];
+                    received_index_set = new Set();
+                    received_chunk_count.value = 0;
+                    retry_code.value = "";
+                    receiver_file_sha256.value = "";
+                    integrity_status.value = "";
+                    corrupt_chunk_count.value = 0;
+                  }
+                  file_metadata.session_id = metadata_packet.session_id;
+                  file_metadata.name = metadata_packet.name;
+                  file_metadata.chunks = metadata_packet.chunks;
+                  file_metadata.compressed_length = metadata_packet.compressed_length;
+                  file_metadata.file_size = metadata_packet.file_size;
+                  file_metadata.file_sha256 = metadata_packet.file_sha256;
+                  user_message.value = `Transferring file: ${file_metadata.name}`;
+                  continue;
+                }
+
+                const data_packet = parse_data_packet(decoded_data);
+                if (!data_packet) {
+                  continue;
+                }
+
+                if (!file_metadata.session_id) {
+                  file_metadata.session_id = data_packet.session_id;
+                  file_metadata.chunks = data_packet.total;
+                  file_metadata.name = `transfer-${data_packet.session_id}.bin`;
+                  user_message.value = `Transferring file: ${file_metadata.name}`;
+                }
+
+                if (
+                  data_packet.session_id !== file_metadata.session_id ||
+                  data_packet.total !== file_metadata.chunks ||
+                  data_packet.index < 0 ||
+                  data_packet.index >= file_metadata.chunks
+                ) {
+                  continue;
+                }
+
+                if (received_index_set.has(data_packet.index)) {
+                  continue;
+                }
+
+                const chunk_data = data_packet.data
+                  ? data_packet.data
+                  : base64_to_uint8(data_packet.data_base64);
+
+                const computed_crc = crc32_bytes(chunk_data)
+                  .toString(16)
+                  .toUpperCase()
+                  .padStart(8, "0");
+                if (computed_crc !== data_packet.chunk_crc) {
+                  corrupt_chunk_count.value += 1;
+                  continue;
+                }
+
+                received_index_set.add(data_packet.index);
+                chunk_store[data_packet.index] = chunk_data;
+                received_chunk_count.value = received_index_set.size;
               } catch (error) {
                 console.error("Error in Loop: ", error);
               }
-              if (!is_receiving.value) {
-                Object.assign(file_metadata, {});
-                decoded_chunks.value = {};
-                user_message.value = "Click receive button to start receiving";
-                return true;
-              }
             }
+
+            if (!is_receiving.value) {
+              return true;
+            }
+
             user_message.value = "Data Transfer Complete";
-            output_array = [];
+
+            let total_output_size = 0;
             for (let i = 0; i < file_metadata.chunks; i++) {
-              output_array = output_array.concat(decoded_chunks.value[i]);
+              const chunk = chunk_store[i];
+              if (!chunk) {
+                user_message.value = "Transfer failed: Missing data chunks";
+                stop_receiver();
+                return;
+              }
+              total_output_size += chunk.length;
             }
-            let output_unit8array = Uint8Array.from(output_array);
-            window.output_unit8array = output_unit8array;
-            let infalted_array = pako.inflate(window.output_unit8array);
-            download_file(infalted_array, file_metadata.name);
-            stop_receiver();
+
+            const compressed_output = new Uint8Array(total_output_size);
+            let offset = 0;
+            for (let i = 0; i < file_metadata.chunks; i++) {
+              const chunk = chunk_store[i];
+              compressed_output.set(chunk, offset);
+              offset += chunk.length;
+            }
+
+            try {
+              const inflated_array = pako.inflate(compressed_output);
+              receiver_file_sha256.value = await sha256_hex(inflated_array);
+
+              if (
+                file_metadata.file_sha256 &&
+                receiver_file_sha256.value !== file_metadata.file_sha256
+              ) {
+                integrity_status.value = "MISMATCH";
+                user_message.value =
+                  "Integrity mismatch. Generate retry code and request retransmit.";
+                const full_retransmit_indices = Array.from(
+                  { length: file_metadata.chunks },
+                  (_, index) => index
+                );
+                retry_code.value = build_retry_code(
+                  file_metadata.session_id,
+                  file_metadata.chunks,
+                  full_retransmit_indices
+                );
+                is_receiving.value = false;
+                return;
+              }
+
+              integrity_status.value = "MATCH";
+              retry_code.value = build_retry_code(
+                file_metadata.session_id,
+                file_metadata.chunks,
+                []
+              );
+              download_file(inflated_array, file_metadata.name);
+              user_message.value = "Transfer complete with verified integrity";
+            } catch (error) {
+              console.error(error);
+              user_message.value = "Transfer failed: Unable to unpack data";
+              stop_receiver();
+              return;
+            }
+
+            is_receiving.value = false;
           };
 
           onMounted(async () => {
@@ -145,9 +555,17 @@
             canvas = document.createElement("canvas");
             context = canvas.getContext("2d");
             await new Promise((r) => setTimeout(r, 2000));
-            canvas.height = videoElement.videoHeight;
-            canvas.width = videoElement.videoWidth;
-            context.drawImage(videoElement, 0, 0);
+
+            const frame_width = videoElement.videoWidth;
+            const frame_height = videoElement.videoHeight;
+            const frame_scale = Math.min(
+              1,
+              SCAN_MAX_DIMENSION / Math.max(frame_width, frame_height)
+            );
+
+            canvas.height = Math.floor(frame_height * frame_scale);
+            canvas.width = Math.floor(frame_width * frame_scale);
+            context.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
           });
 
           return {
@@ -155,8 +573,16 @@
             start_receiver,
             is_receiving,
             file_metadata,
-            decoded_chunks,
+            received_chunk_count,
             stop_receiver,
+            generate_retry_code,
+            copy_retry_code,
+            retry_code,
+            receiver_file_sha256,
+            integrity_status,
+            missing_chunk_count,
+            corrupt_chunk_count,
+            short_checksum,
           };
         },
       }).mount("#app");

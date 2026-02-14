@@ -14,6 +14,11 @@
       >
         <div class="text-xl my-4">Data Sender Mode</div>
         <div class="text-sm mb-4">{{user_message}}</div>
+        <div v-if="transfer_summary.ready" class="text-sm mb-4">
+          Session: {{transfer_summary.session_id}} | Chunks:
+          {{transfer_summary.total_chunks}} | SHA256:
+          {{short_checksum(transfer_summary.file_sha256)}}
+        </div>
         <div class="w-1/2 mb-4">
           <input
             class="block w-full text-sm text-gray-900 border border-gray-300 cursor-pointer bg-gray-50 focus:outline-none"
@@ -35,6 +40,24 @@
         >
           Stop Transfer
         </button>
+        <div
+          v-if="transfer_summary.ready && !is_transferring"
+          class="w-3/4 mb-4 text-sm"
+        >
+          <div class="mb-2">Paste retry code from receiver:</div>
+          <input
+            v-model.trim="retry_code_input"
+            class="block w-full text-sm text-gray-900 border border-gray-300 px-2 py-1 mb-2"
+            type="text"
+            placeholder="R1:session:chunks:missing-ranges:crc"
+          />
+          <button
+            v-on:click="retry_missing_chunks"
+            class="p-1 border-2 border-gray-500"
+          >
+            Resend Missing Chunks
+          </button>
+        </div>
         <div id="qrcode" class=""></div>
       </div>
     </div>
@@ -42,58 +65,485 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.0.3/pako.min.js"></script>
     <script>
-      const { createApp, ref, onMounted } = Vue;
+      const { createApp, ref, reactive, onMounted } = Vue;
+
+      const INITIAL_CHUNK_SIZE = 420;
+      const MIN_CHUNK_SIZE = 80;
+      const FRAME_INTERVAL_MS = 80;
+      const START_DELAY_MS = 500;
+      const COMPRESSION_LEVEL = 3;
+      const METADATA_REPEAT_COUNT = 3;
+      const INITIAL_PASS_REPEAT_COUNT = 2;
+      const RETRY_REPEAT_COUNT = 2;
+
+      const CRC32_TABLE = (() => {
+        const table = new Uint32Array(256);
+        for (let i = 0; i < 256; i++) {
+          let crc = i;
+          for (let j = 0; j < 8; j++) {
+            crc = (crc & 1) ? 0xedb88320 ^ (crc >>> 1) : crc >>> 1;
+          }
+          table[i] = crc >>> 0;
+        }
+        return table;
+      })();
 
       createApp({
         setup() {
           const user_message = ref("Choose file to get started");
           const is_transferring = ref(false);
-          const chunk_size = 250;
+          const retry_code_input = ref("");
+          const transfer_summary = reactive({
+            ready: false,
+            session_id: "",
+            file_name: "",
+            total_chunks: 0,
+            file_size: 0,
+            file_sha256: "",
+          });
           let qrcode_object = "";
+          let active_transfer = null;
 
-          const encode_data = (index, input_bytes) => {
-            let encoded_string = String.fromCharCode.apply(null, input_bytes);
-            let utf8Encoder = new TextEncoder();
-            let utf8_bytes = utf8Encoder.encode(encoded_string);
-            let encoded_data = btoa(
-              String.fromCharCode.apply(null, utf8_bytes)
+          const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+          const crc32_bytes = (bytes) => {
+            let crc = 0xffffffff;
+            for (let i = 0; i < bytes.length; i++) {
+              crc = CRC32_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+            }
+            return (crc ^ 0xffffffff) >>> 0;
+          };
+
+          const crc32_text = (value) => {
+            return crc32_bytes(new TextEncoder().encode(value));
+          };
+
+          const short_checksum = (value) => {
+            if (!value) {
+              return "-";
+            }
+            return value.slice(0, 16).toUpperCase();
+          };
+
+          const sha256_hex = async (bytes) => {
+            if (!window.crypto || !window.crypto.subtle) {
+              throw new Error("SHA-256 not available in this browser context");
+            }
+            const digest = await window.crypto.subtle.digest("SHA-256", bytes);
+            const output = Array.from(new Uint8Array(digest));
+            return output
+              .map((value) => value.toString(16).padStart(2, "0"))
+              .join("");
+          };
+
+          const uint8_to_base64 = (bytes) => {
+            let binary = "";
+            const batch_size = 0x8000;
+            for (let i = 0; i < bytes.length; i += batch_size) {
+              binary += String.fromCharCode.apply(
+                null,
+                bytes.subarray(i, i + batch_size)
+              );
+            }
+            return btoa(binary);
+          };
+
+          const text_to_base64 = (value) => {
+            const encoded = new TextEncoder().encode(value);
+            return uint8_to_base64(encoded);
+          };
+
+          const encode_indices_to_ranges = (indices) => {
+            if (!indices.length) {
+              return "NONE";
+            }
+
+            const ordered = Array.from(new Set(indices)).sort((a, b) => a - b);
+            const ranges = [];
+            let start = ordered[0];
+            let previous = ordered[0];
+
+            for (let i = 1; i < ordered.length; i++) {
+              const current = ordered[i];
+              if (current === previous + 1) {
+                previous = current;
+                continue;
+              }
+
+              ranges.push(
+                start === previous
+                  ? start.toString(36).toUpperCase()
+                  : `${start.toString(36).toUpperCase()}-${previous
+                      .toString(36)
+                      .toUpperCase()}`
+              );
+              start = current;
+              previous = current;
+            }
+
+            ranges.push(
+              start === previous
+                ? start.toString(36).toUpperCase()
+                : `${start.toString(36).toUpperCase()}-${previous
+                    .toString(36)
+                    .toUpperCase()}`
             );
-            return index + "," + encoded_data;
+
+            return ranges.join(".");
+          };
+
+          const decode_ranges_to_indices = (payload, total_chunks) => {
+            if (payload === "NONE") {
+              return [];
+            }
+
+            const output = [];
+            const segments = payload.split(".");
+
+            for (const segment of segments) {
+              if (!segment) {
+                continue;
+              }
+
+              if (segment.includes("-")) {
+                const [start_text, end_text] = segment.split("-");
+                const start = Number.parseInt(start_text, 36);
+                const end = Number.parseInt(end_text, 36);
+                if (
+                  !Number.isFinite(start) ||
+                  !Number.isFinite(end) ||
+                  start < 0 ||
+                  end < start
+                ) {
+                  throw new Error("Retry code contains invalid range");
+                }
+
+                for (let value = start; value <= end; value++) {
+                  if (value < total_chunks) {
+                    output.push(value);
+                  }
+                }
+              } else {
+                const single = Number.parseInt(segment, 36);
+                if (!Number.isFinite(single) || single < 0) {
+                  throw new Error("Retry code contains invalid index");
+                }
+                if (single < total_chunks) {
+                  output.push(single);
+                }
+              }
+            }
+
+            return Array.from(new Set(output)).sort((a, b) => a - b);
+          };
+
+          const build_retry_code = (session_id, total_chunks, indices) => {
+            const payload = encode_indices_to_ranges(indices);
+            const body = `R1:${session_id}:${total_chunks}:${payload}`;
+            const checksum = (crc32_text(body) & 0xffff)
+              .toString(36)
+              .toUpperCase()
+              .padStart(3, "0");
+            return `${body}:${checksum}`;
+          };
+
+          const parse_retry_code = (input_code) => {
+            const parts = input_code.trim().split(":");
+            if (parts.length !== 5 || parts[0] !== "R1") {
+              throw new Error("Retry code format is invalid");
+            }
+
+            const body = parts.slice(0, 4).join(":");
+            const provided_checksum = parts[4].toUpperCase();
+            const expected_checksum = (crc32_text(body) & 0xffff)
+              .toString(36)
+              .toUpperCase()
+              .padStart(3, "0");
+            if (provided_checksum !== expected_checksum) {
+              throw new Error("Retry code checksum mismatch");
+            }
+
+            const total_chunks = Number.parseInt(parts[2], 10);
+            if (!Number.isFinite(total_chunks) || total_chunks <= 0) {
+              throw new Error("Retry code total chunk count is invalid");
+            }
+
+            return {
+              session_id: parts[1],
+              total_chunks,
+              indices: decode_ranges_to_indices(parts[3], total_chunks),
+            };
+          };
+
+          const build_metadata_packet = (
+            session_id,
+            file_name,
+            total_chunks,
+            compressed_length,
+            file_size,
+            file_sha256
+          ) => {
+            return `M:${session_id}:${total_chunks}:${compressed_length}:${file_size}:${file_sha256}:${text_to_base64(
+              file_name
+            )}`;
+          };
+
+          const build_data_packet = (
+            session_id,
+            index,
+            total_chunks,
+            input_bytes,
+            chunk_crc
+          ) => {
+            return `D:${session_id}:${index}:${total_chunks}:${chunk_crc}:${uint8_to_base64(
+              input_bytes
+            )}`;
+          };
+
+          const can_fit_in_qr = (packet) => {
+            try {
+              qrcode_object.makeCode(packet);
+              return true;
+            } catch (error) {
+              if (
+                error &&
+                typeof error.message === "string" &&
+                error.message.includes("code length overflow")
+              ) {
+                return false;
+              }
+              throw error;
+            }
+          };
+
+          const get_chunk_packet = (index) => {
+            const start = index * active_transfer.chunk_size;
+            const chunk = active_transfer.compressed_data.subarray(
+              start,
+              start + active_transfer.chunk_size
+            );
+            let chunk_crc = active_transfer.chunk_crc_map[index];
+            if (!chunk_crc) {
+              chunk_crc = crc32_bytes(chunk)
+                .toString(16)
+                .toUpperCase()
+                .padStart(8, "0");
+              active_transfer.chunk_crc_map[index] = chunk_crc;
+            }
+
+            return build_data_packet(
+              active_transfer.session_id,
+              index,
+              active_transfer.total_chunks,
+              chunk,
+              chunk_crc
+            );
+          };
+
+          const send_chunk_indices = async (
+            chunk_indices,
+            repeat_count,
+            phase_label
+          ) => {
+            if (!active_transfer || !chunk_indices.length) {
+              return;
+            }
+
+            is_transferring.value = true;
+
+            for (let i = 0; i < METADATA_REPEAT_COUNT; i++) {
+              qrcode_object.makeCode(active_transfer.metadata_packet);
+              await sleep(FRAME_INTERVAL_MS);
+            }
+
+            await sleep(START_DELAY_MS);
+
+            let sent_count = 0;
+
+            outer_loop: for (let i = 0; i < chunk_indices.length; i++) {
+              const chunk_index = chunk_indices[i];
+              const packet = get_chunk_packet(chunk_index);
+
+              for (let copy = 0; copy < repeat_count; copy++) {
+                if (!is_transferring.value) {
+                  break outer_loop;
+                }
+
+                qrcode_object.makeCode(packet);
+                sent_count += 1;
+                user_message.value = `${phase_label} chunk ${chunk_index + 1}/${
+                  active_transfer.total_chunks
+                } (${i + 1}/${chunk_indices.length})`;
+                await sleep(FRAME_INTERVAL_MS);
+              }
+            }
+
+            is_transferring.value = false;
+            if (sent_count > 0) {
+              const expected_retry = build_retry_code(
+                active_transfer.session_id,
+                active_transfer.total_chunks,
+                []
+              );
+              user_message.value =
+                "Pass finished. Use receiver retry code for missing chunks. If complete, receiver should show integrity match.";
+              if (retry_code_input.value === expected_retry) {
+                retry_code_input.value = "";
+              }
+            }
           };
 
           const stop_transfer = () => {
             is_transferring.value = false;
-            user_message.value = "Choose file to get started";
+            user_message.value = transfer_summary.ready
+              ? "Transfer paused. Paste retry code to continue."
+              : "Choose file to get started";
           };
 
           const start_transfer = async () => {
-            let file_input = document.getElementById("file_input");
-            is_transferring.value = true;
-            let file = file_input.files[0];
-            let data_chunks = [];
-            let data_array = pako.gzip(await file.arrayBuffer(), { level: 9 });
-            let total_chunks = Math.ceil(data_array.length / chunk_size);
-            let file_metadata = { name: file.name, chunks: total_chunks };
-            qrcode_object.clear();
-            qrcode_object.makeCode(JSON.stringify(file_metadata));
-            user_message.value = "Starting data transfer in few seconds ...";
-            await new Promise((r) => setTimeout(r, 1000));
-            for (let i = 0; i < total_chunks; i++) {
-              await new Promise((r) => setTimeout(r, 50));
-              let start = i * chunk_size;
-              let chunk = data_array.subarray(start, start + chunk_size);
-              let encoded_data = encode_data(i, chunk);
-              qrcode_object.clear();
-              qrcode_object.makeCode(encoded_data);
-              user_message.value = `Transfering Chunk ${i}/${total_chunks} ...`;
-              if (!is_transferring.value) {
-                user_message.value = "Choose file to get started";
-                qrcode_object.clear();
-                qrcode_object.makeCode("Choose file to get started");
-                break;
-              }
+            const file_input = document.getElementById("file_input");
+            const file = file_input.files[0];
+
+            if (!file) {
+              user_message.value = "Choose a file before starting transfer";
+              return;
             }
-            stop_transfer();
+
+            is_transferring.value = true;
+
+            try {
+              const file_buffer = await file.arrayBuffer();
+              const original_bytes = new Uint8Array(file_buffer);
+              const file_sha256 = await sha256_hex(original_bytes);
+
+              const compressed_data = pako.gzip(file_buffer, {
+                level: COMPRESSION_LEVEL,
+              });
+              const session_id = Date.now().toString(36);
+              let transfer_file_name = file.name;
+
+              let chunk_size = INITIAL_CHUNK_SIZE;
+              let total_chunks = 0;
+              let metadata_packet = "";
+
+              while (true) {
+                total_chunks = Math.ceil(compressed_data.length / chunk_size);
+                metadata_packet = build_metadata_packet(
+                  session_id,
+                  transfer_file_name,
+                  total_chunks,
+                  compressed_data.length,
+                  original_bytes.length,
+                  file_sha256
+                );
+
+                if (!can_fit_in_qr(metadata_packet)) {
+                  if (transfer_file_name !== "transfer.bin") {
+                    transfer_file_name = "transfer.bin";
+                    continue;
+                  }
+                  throw new Error("Unable to fit transfer metadata into QR capacity");
+                }
+
+                const probe_chunk = compressed_data.subarray(
+                  0,
+                  Math.min(chunk_size, compressed_data.length)
+                );
+                const probe_packet = build_data_packet(
+                  session_id,
+                  total_chunks - 1,
+                  total_chunks,
+                  probe_chunk,
+                  crc32_bytes(probe_chunk)
+                    .toString(16)
+                    .toUpperCase()
+                    .padStart(8, "0")
+                );
+
+                if (can_fit_in_qr(probe_packet)) {
+                  break;
+                }
+
+                chunk_size = Math.floor(chunk_size * 0.8);
+                if (chunk_size < MIN_CHUNK_SIZE) {
+                  throw new Error(
+                    "Unable to fit transfer packets into QR capacity"
+                  );
+                }
+              }
+
+              active_transfer = {
+                session_id,
+                total_chunks,
+                chunk_size,
+                compressed_data,
+                metadata_packet,
+                file_sha256,
+                file_name: transfer_file_name,
+                file_size: original_bytes.length,
+                chunk_crc_map: {},
+              };
+
+              transfer_summary.ready = true;
+              transfer_summary.session_id = session_id;
+              transfer_summary.file_name = transfer_file_name;
+              transfer_summary.total_chunks = total_chunks;
+              transfer_summary.file_size = original_bytes.length;
+              transfer_summary.file_sha256 = file_sha256;
+
+              const all_indices = Array.from(
+                { length: total_chunks },
+                (_, index) => index
+              );
+              await send_chunk_indices(
+                all_indices,
+                INITIAL_PASS_REPEAT_COUNT,
+                "Transferring"
+              );
+            } catch (error) {
+              is_transferring.value = false;
+              console.error(error);
+              user_message.value =
+                "Transfer failed. Reduce file size or move devices closer.";
+            }
+          };
+
+          const retry_missing_chunks = async () => {
+            if (!transfer_summary.ready || !active_transfer) {
+              user_message.value = "Start a transfer before applying retry code";
+              return;
+            }
+
+            if (!retry_code_input.value) {
+              user_message.value = "Paste retry code from receiver";
+              return;
+            }
+
+            try {
+              const parsed = parse_retry_code(retry_code_input.value);
+              if (parsed.session_id !== active_transfer.session_id) {
+                throw new Error("Retry code is for a different session");
+              }
+
+              if (parsed.total_chunks !== active_transfer.total_chunks) {
+                throw new Error("Retry code chunk count does not match sender");
+              }
+
+              if (!parsed.indices.length) {
+                user_message.value =
+                  "Receiver reports no missing chunks. Verify checksum on receiver.";
+                return;
+              }
+
+              await send_chunk_indices(
+                parsed.indices,
+                RETRY_REPEAT_COUNT,
+                "Retrying"
+              );
+            } catch (error) {
+              console.error(error);
+              user_message.value = `Invalid retry code: ${error.message}`;
+            }
           };
 
           onMounted(() => {
@@ -116,6 +566,10 @@
             start_transfer,
             stop_transfer,
             is_transferring,
+            retry_code_input,
+            retry_missing_chunks,
+            transfer_summary,
+            short_checksum,
           };
         },
       }).mount("#app");
