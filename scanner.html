@@ -181,24 +181,28 @@
             }
 
             const values = parts.map((part) => Number.parseInt(part, 36));
-            if (values.some((value) => !Number.isFinite(value) || value <= 0)) {
+            if (values.some((value) => !Number.isFinite(value) || value < 0)) {
               return null;
             }
 
-            if (parts.length === 4) {
-              return {
-                frame_interval_ms: values[0],
-                start_delay_ms: values[1],
-                retry_repeat_count: values[2],
-                initial_chunk_size: values[3],
-              };
+            const frame_interval_ms = values[0];
+            const start_delay_ms = values[1];
+            const retry_repeat_count = parts.length === 4 ? values[2] : values[4];
+            const initial_chunk_size = parts.length === 4 ? values[3] : values[5];
+
+            if (
+              frame_interval_ms <= 0 ||
+              retry_repeat_count <= 0 ||
+              initial_chunk_size <= 0
+            ) {
+              return null;
             }
 
             return {
-              frame_interval_ms: values[0],
-              start_delay_ms: values[1],
-              retry_repeat_count: values[4],
-              initial_chunk_size: values[5],
+              frame_interval_ms,
+              start_delay_ms,
+              retry_repeat_count,
+              initial_chunk_size,
             };
           };
 
@@ -541,10 +545,12 @@
             URL.revokeObjectURL(url);
           };
 
-          const stop_receiver = () => {
+          const stop_receiver = (show_default_message = true) => {
             is_receiving.value = false;
             reset_transfer_state();
-            user_message.value = "Click receive button to start receiving";
+            if (show_default_message) {
+              user_message.value = "Click receive button to start receiving";
+            }
           };
 
           const start_receiver = async () => {
@@ -810,7 +816,7 @@
               const chunk = chunk_store[i];
               if (!chunk) {
                 user_message.value = "Transfer failed: Missing data chunks";
-                stop_receiver();
+                stop_receiver(false);
                 return;
               }
               total_output_size += chunk.length;
