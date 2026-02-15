@@ -120,6 +120,7 @@
           let canvas, context, videoElement;
           let media_stream = null;
           let last_decoded_payload = "";
+          let last_applied_sender_profile = "";
           let chunk_store = [];
           let received_index_set = new Set();
           let scan_source_rect = { x: 0, y: 0, width: 0, height: 0 };
@@ -175,7 +176,7 @@
             }
 
             const parts = profile_text.split(".");
-            if (parts.length !== 6) {
+            if (parts.length !== 4 && parts.length !== 6) {
               return null;
             }
 
@@ -184,11 +185,18 @@
               return null;
             }
 
+            if (parts.length === 4) {
+              return {
+                frame_interval_ms: values[0],
+                start_delay_ms: values[1],
+                retry_repeat_count: values[2],
+                initial_chunk_size: values[3],
+              };
+            }
+
             return {
               frame_interval_ms: values[0],
               start_delay_ms: values[1],
-              metadata_repeat_count: values[2],
-              initial_pass_repeat_count: values[3],
               retry_repeat_count: values[4],
               initial_chunk_size: values[5],
             };
@@ -372,10 +380,7 @@
                   session_id: file_metadata.session_id || "legacy",
                   index: legacy_index,
                   total: file_metadata.chunks || 0,
-                  chunk_crc: crc32_bytes(legacy_data)
-                    .toString(16)
-                    .toUpperCase()
-                    .padStart(8, "0"),
+                  chunk_crc_num: crc32_bytes(legacy_data) >>> 0,
                   data: legacy_data,
                 };
               }
@@ -388,7 +393,15 @@
 
             const index = Number.parseInt(parts[2], 10);
             const total = Number.parseInt(parts[3], 10);
+            const chunk_crc_num = Number.parseInt(parts[4], 16);
             if (!Number.isFinite(index) || !Number.isFinite(total) || total <= 0) {
+              return null;
+            }
+            if (
+              !Number.isFinite(chunk_crc_num) ||
+              chunk_crc_num < 0 ||
+              chunk_crc_num > 0xffffffff
+            ) {
               return null;
             }
 
@@ -396,7 +409,7 @@
               session_id: parts[1],
               index,
               total,
-              chunk_crc: parts[4].toUpperCase(),
+              chunk_crc_num: chunk_crc_num >>> 0,
               data_base64: parts[5],
             };
           };
@@ -487,6 +500,7 @@
             integrity_status.value = "";
             corrupt_chunk_count.value = 0;
             last_decoded_payload = "";
+            last_applied_sender_profile = "";
           };
 
           const generate_retry_code = () => {
@@ -654,7 +668,6 @@
               }
 
               try {
-                runtime_config = get_scanner_config();
                 await sleep(runtime_config.scan_interval_ms);
                 context.drawImage(
                   videoElement,
@@ -691,7 +704,21 @@
 
                 const metadata_packet = parse_metadata_packet(decoded_data);
                 if (metadata_packet) {
-                  if (metadata_packet.session_id !== file_metadata.session_id) {
+                  const is_new_session =
+                    metadata_packet.session_id !== file_metadata.session_id;
+                  const sender_profile_changed =
+                    metadata_packet.sender_profile !== last_applied_sender_profile;
+                  const metadata_changed =
+                    is_new_session ||
+                    file_metadata.name !== metadata_packet.name ||
+                    file_metadata.chunks !== metadata_packet.chunks ||
+                    file_metadata.compressed_length !==
+                      metadata_packet.compressed_length ||
+                    file_metadata.file_size !== metadata_packet.file_size ||
+                    file_metadata.file_sha256 !== metadata_packet.file_sha256 ||
+                    file_metadata.sender_profile !== metadata_packet.sender_profile;
+
+                  if (is_new_session) {
                     chunk_store = [];
                     received_index_set = new Set();
                     received_chunk_count.value = 0;
@@ -701,17 +728,26 @@
                     corrupt_chunk_count.value = 0;
                     last_new_chunk_ts = packet_seen_ts;
                   }
-                  file_metadata.session_id = metadata_packet.session_id;
-                  file_metadata.name = metadata_packet.name;
-                  file_metadata.chunks = metadata_packet.chunks;
-                  file_metadata.compressed_length = metadata_packet.compressed_length;
-                  file_metadata.file_size = metadata_packet.file_size;
-                  file_metadata.file_sha256 = metadata_packet.file_sha256;
-                  file_metadata.sender_profile = metadata_packet.sender_profile;
-                  apply_sender_profile(metadata_packet.sender_profile);
-                  runtime_config = get_scanner_config();
-                  configure_scan_canvas(runtime_config);
-                  user_message.value = `Transferring file: ${file_metadata.name}`;
+
+                  if (metadata_changed) {
+                    file_metadata.session_id = metadata_packet.session_id;
+                    file_metadata.name = metadata_packet.name;
+                    file_metadata.chunks = metadata_packet.chunks;
+                    file_metadata.compressed_length =
+                      metadata_packet.compressed_length;
+                    file_metadata.file_size = metadata_packet.file_size;
+                    file_metadata.file_sha256 = metadata_packet.file_sha256;
+                    file_metadata.sender_profile = metadata_packet.sender_profile;
+                    user_message.value = `Transferring file: ${file_metadata.name}`;
+                  }
+
+                  if (is_new_session || sender_profile_changed) {
+                    apply_sender_profile(metadata_packet.sender_profile);
+                    runtime_config = get_scanner_config();
+                    configure_scan_canvas(runtime_config);
+                    last_applied_sender_profile = metadata_packet.sender_profile;
+                  }
+
                   continue;
                 }
 
@@ -744,11 +780,8 @@
                   ? data_packet.data
                   : base64_to_uint8(data_packet.data_base64);
 
-                const computed_crc = crc32_bytes(chunk_data)
-                  .toString(16)
-                  .toUpperCase()
-                  .padStart(8, "0");
-                if (computed_crc !== data_packet.chunk_crc) {
+                const computed_crc = crc32_bytes(chunk_data) >>> 0;
+                if (computed_crc !== data_packet.chunk_crc_num) {
                   corrupt_chunk_count.value += 1;
                   continue;
                 }

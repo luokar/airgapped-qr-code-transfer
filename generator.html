@@ -114,21 +114,14 @@
           min_chunk_size: 100,
           chunk_safety_ratio: 0.9,
           large_transfer_chunk_threshold: 700,
-          large_transfer_repeat_boost: 1,
           very_large_transfer_chunk_threshold: 1000,
-          very_large_transfer_repeat_boost: 1,
-          max_initial_pass_repeat_count: 4,
           frame_interval_ms: 62,
           start_delay_ms: 460,
           compression_level: 3,
-          metadata_repeat_count: 3,
-          metadata_heartbeat_interval: 130,
-          initial_pass_repeat_count: 2,
           retry_repeat_count: 2,
           retry_high_loss_threshold: 0.13,
           retry_high_loss_frame_multiplier: 1.2,
           retry_high_loss_start_delay_multiplier: 1.15,
-          retry_high_loss_metadata_extra: 1,
           retry_high_loss_repeat_increment: 1,
         },
         Aggressive: {
@@ -136,21 +129,14 @@
           min_chunk_size: 100,
           chunk_safety_ratio: 0.85,
           large_transfer_chunk_threshold: 620,
-          large_transfer_repeat_boost: 1,
           very_large_transfer_chunk_threshold: 900,
-          very_large_transfer_repeat_boost: 1,
-          max_initial_pass_repeat_count: 4,
           frame_interval_ms: 54,
           start_delay_ms: 340,
           compression_level: 2,
-          metadata_repeat_count: 2,
-          metadata_heartbeat_interval: 120,
-          initial_pass_repeat_count: 1,
           retry_repeat_count: 2,
           retry_high_loss_threshold: 0.09,
           retry_high_loss_frame_multiplier: 1.3,
           retry_high_loss_start_delay_multiplier: 1.2,
-          retry_high_loss_metadata_extra: 1,
           retry_high_loss_repeat_increment: 1,
         },
         Extreme: {
@@ -158,21 +144,14 @@
           min_chunk_size: 120,
           chunk_safety_ratio: 0.84,
           large_transfer_chunk_threshold: 560,
-          large_transfer_repeat_boost: 1,
           very_large_transfer_chunk_threshold: 820,
-          very_large_transfer_repeat_boost: 1,
-          max_initial_pass_repeat_count: 4,
           frame_interval_ms: 48,
           start_delay_ms: 260,
           compression_level: 2,
-          metadata_repeat_count: 2,
-          metadata_heartbeat_interval: 100,
-          initial_pass_repeat_count: 1,
           retry_repeat_count: 2,
           retry_high_loss_threshold: 0.08,
           retry_high_loss_frame_multiplier: 1.5,
           retry_high_loss_start_delay_multiplier: 1.25,
-          retry_high_loss_metadata_extra: 2,
           retry_high_loss_repeat_increment: 2,
         },
         Balanced: {
@@ -180,21 +159,14 @@
           min_chunk_size: 80,
           chunk_safety_ratio: 0.91,
           large_transfer_chunk_threshold: 900,
-          large_transfer_repeat_boost: 1,
           very_large_transfer_chunk_threshold: 1300,
-          very_large_transfer_repeat_boost: 1,
-          max_initial_pass_repeat_count: 4,
           frame_interval_ms: 88,
           start_delay_ms: 640,
           compression_level: 4,
-          metadata_repeat_count: 4,
-          metadata_heartbeat_interval: 170,
-          initial_pass_repeat_count: 2,
           retry_repeat_count: 2,
           retry_high_loss_threshold: 0.15,
           retry_high_loss_frame_multiplier: 1.2,
           retry_high_loss_start_delay_multiplier: 1.1,
-          retry_high_loss_metadata_extra: 1,
           retry_high_loss_repeat_increment: 1,
         },
         Reliable: {
@@ -202,21 +174,14 @@
           min_chunk_size: 80,
           chunk_safety_ratio: 0.95,
           large_transfer_chunk_threshold: 1000,
-          large_transfer_repeat_boost: 1,
           very_large_transfer_chunk_threshold: 1500,
-          very_large_transfer_repeat_boost: 1,
-          max_initial_pass_repeat_count: 5,
           frame_interval_ms: 115,
           start_delay_ms: 860,
           compression_level: 6,
-          metadata_repeat_count: 5,
-          metadata_heartbeat_interval: 210,
-          initial_pass_repeat_count: 3,
           retry_repeat_count: 3,
           retry_high_loss_threshold: 0.18,
           retry_high_loss_frame_multiplier: 1.1,
           retry_high_loss_start_delay_multiplier: 1.05,
-          retry_high_loss_metadata_extra: 1,
           retry_high_loss_repeat_increment: 1,
         },
       };
@@ -245,11 +210,6 @@
           Number(preset.frame_interval_ms) ||
             SENDER_PRESETS[DEFAULT_PRESET_NAME].frame_interval_ms
         );
-        const initial_pass_repeat_count = Math.max(
-          1,
-          Number(preset.initial_pass_repeat_count) ||
-            SENDER_PRESETS[DEFAULT_PRESET_NAME].initial_pass_repeat_count
-        );
         const start_delay_ms = Math.max(
           0,
           Number(preset.start_delay_ms) ||
@@ -261,7 +221,7 @@
 
         return (
           payload_per_frame /
-          (frame_interval_ms * initial_pass_repeat_count * startup_penalty)
+          (frame_interval_ms * startup_penalty)
         );
       };
 
@@ -410,35 +370,12 @@
                       .large_transfer_chunk_threshold
                 )
               ),
-              large_transfer_repeat_boost: Math.floor(
-                Math.max(
-                  0,
-                  Number(selected_profile.large_transfer_repeat_boost) ||
-                    SENDER_PRESETS[DEFAULT_PRESET_NAME].large_transfer_repeat_boost
-                )
-              ),
               very_large_transfer_chunk_threshold: Math.floor(
                 Math.max(
                   1,
                   Number(selected_profile.very_large_transfer_chunk_threshold) ||
                     SENDER_PRESETS[DEFAULT_PRESET_NAME]
                       .very_large_transfer_chunk_threshold
-                )
-              ),
-              very_large_transfer_repeat_boost: Math.floor(
-                Math.max(
-                  0,
-                  Number(selected_profile.very_large_transfer_repeat_boost) ||
-                    SENDER_PRESETS[DEFAULT_PRESET_NAME]
-                      .very_large_transfer_repeat_boost
-                )
-              ),
-              max_initial_pass_repeat_count: Math.floor(
-                Math.max(
-                  1,
-                  Number(selected_profile.max_initial_pass_repeat_count) ||
-                    SENDER_PRESETS[DEFAULT_PRESET_NAME]
-                      .max_initial_pass_repeat_count
                 )
               ),
               frame_interval_ms: Math.floor(
@@ -463,28 +400,6 @@
                     Number(selected_profile.compression_level) ||
                       SENDER_PRESETS[DEFAULT_PRESET_NAME].compression_level
                   )
-                )
-              ),
-              metadata_repeat_count: Math.floor(
-                Math.max(
-                  1,
-                  Number(selected_profile.metadata_repeat_count) ||
-                    SENDER_PRESETS[DEFAULT_PRESET_NAME].metadata_repeat_count
-                )
-              ),
-              metadata_heartbeat_interval: Math.floor(
-                Math.max(
-                  0,
-                  Number(selected_profile.metadata_heartbeat_interval) ||
-                    SENDER_PRESETS[DEFAULT_PRESET_NAME]
-                      .metadata_heartbeat_interval
-                )
-              ),
-              initial_pass_repeat_count: Math.floor(
-                Math.max(
-                  1,
-                  Number(selected_profile.initial_pass_repeat_count) ||
-                    SENDER_PRESETS[DEFAULT_PRESET_NAME].initial_pass_repeat_count
                 )
               ),
               retry_repeat_count: Math.floor(
@@ -514,14 +429,6 @@
                   SENDER_PRESETS[DEFAULT_PRESET_NAME]
                     .retry_high_loss_start_delay_multiplier
               ),
-              retry_high_loss_metadata_extra: Math.floor(
-                Math.max(
-                  0,
-                  Number(selected_profile.retry_high_loss_metadata_extra) ||
-                    SENDER_PRESETS[DEFAULT_PRESET_NAME]
-                      .retry_high_loss_metadata_extra
-                )
-              ),
               retry_high_loss_repeat_increment: Math.floor(
                 Math.max(
                   0,
@@ -537,7 +444,7 @@
             const config = get_sender_config();
             return `chunk=${config.initial_chunk_size}, safe=${Math.round(
               config.chunk_safety_ratio * 100
-            )}%, frame=${config.frame_interval_ms}ms, start=${config.start_delay_ms}ms, comp=${config.compression_level}, meta=${config.metadata_repeat_count}, hb=${config.metadata_heartbeat_interval}, init=${config.initial_pass_repeat_count}, retry=${config.retry_repeat_count}`;
+            )}%, frame=${config.frame_interval_ms}ms, start=${config.start_delay_ms}ms, comp=${config.compression_level}, retry=${config.retry_repeat_count}`;
           });
 
           const transfer_progress_percent = computed(() => {
@@ -552,17 +459,6 @@
               )
             );
           });
-
-          const get_initial_pass_repeat_count = (runtime_config, total_chunks) => {
-            let repeats = runtime_config.initial_pass_repeat_count;
-            if (total_chunks >= runtime_config.large_transfer_chunk_threshold) {
-              repeats += runtime_config.large_transfer_repeat_boost;
-            }
-            if (total_chunks >= runtime_config.very_large_transfer_chunk_threshold) {
-              repeats += runtime_config.very_large_transfer_repeat_boost;
-            }
-            return Math.min(runtime_config.max_initial_pass_repeat_count, repeats);
-          };
 
           const crc32_bytes = (bytes) => {
             let crc = 0xffffffff;
@@ -845,8 +741,6 @@
             return [
               runtime_config.frame_interval_ms,
               runtime_config.start_delay_ms,
-              runtime_config.metadata_repeat_count,
-              runtime_config.initial_pass_repeat_count,
               runtime_config.retry_repeat_count,
               runtime_config.initial_chunk_size,
             ]
@@ -923,10 +817,8 @@
             await nextTick();
             fit_qr_to_viewport(true);
 
-            for (let i = 0; i < runtime_config.metadata_repeat_count; i++) {
-              show_qr_payload(active_transfer.metadata_packet);
-              await sleep(runtime_config.frame_interval_ms);
-            }
+            show_qr_payload(active_transfer.metadata_packet);
+            await sleep(runtime_config.frame_interval_ms);
 
             await sleep(runtime_config.start_delay_ms);
 
@@ -953,13 +845,6 @@
                 transfer_progress.current_round = round + 1;
                 transfer_progress.current_chunk = chunk_index + 1;
                 transfer_progress.sent_packets = sent_count;
-                if (
-                  runtime_config.metadata_heartbeat_interval > 0 &&
-                  sent_count % runtime_config.metadata_heartbeat_interval === 0
-                ) {
-                  show_qr_payload(active_transfer.metadata_packet);
-                  await sleep(runtime_config.frame_interval_ms);
-                }
                 user_message.value = `${phase_label} round ${round + 1}/${rounds} chunk ${
                   chunk_index + 1
                 }/${active_transfer.total_chunks} (${i + 1}/${chunk_indices.length})`;
@@ -1107,18 +992,13 @@
               transfer_summary.file_size = original_bytes.length;
               transfer_summary.file_sha256 = file_sha256;
 
-              const initial_repeat_count = get_initial_pass_repeat_count(
-                runtime_config,
-                total_chunks
-              );
-
               const all_indices = Array.from(
                 { length: total_chunks },
                 (_, index) => index
               );
               await send_chunk_indices(
                 all_indices,
-                initial_repeat_count,
+                1,
                 "Transferring",
                 runtime_config
               );
@@ -1193,9 +1073,6 @@
                   runtime_config.start_delay_ms *
                     runtime_config.retry_high_loss_start_delay_multiplier
                 );
-                adjusted_runtime_config.metadata_repeat_count =
-                  runtime_config.metadata_repeat_count +
-                  runtime_config.retry_high_loss_metadata_extra;
                 retry_repeat_count += runtime_config.retry_high_loss_repeat_increment;
               }
 
